@@ -1,0 +1,184 @@
+:root{
+  --ink: #0b1020;
+  --panel: #111827;
+  --panel-border: #1f2937;
+  --text: #e5e7eb;
+  --text-dim: #9ca3af;
+  --amber: #f59e0b;
+  --amber-dim: rgba(245,158,11,0.35);
+  --danger: #ef4444;
+  --radius: 14px;
+}
+
+*{ box-sizing:border-box; }
+html,body{ height:100%; margin:0; }
+body{
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  background: var(--ink);
+  color: var(--text);
+  overscroll-behavior: none;
+}
+
+#map{
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  filter: saturate(0.75) brightness(0.85);
+}
+
+/* HUD */
+#hud{
+  position: fixed;
+  top: max(12px, env(safe-area-inset-top));
+  left: 12px;
+  right: 12px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(17,24,39,0.88);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+.hud-stat{ display:flex; flex-direction:column; line-height:1.2; }
+.hud-label{ font-size: 11px; color: var(--text-dim); }
+.hud-value{ font-size: 16px; font-weight: 700; color: var(--amber); }
+.hud-divider{ width:1px; align-self:stretch; background: var(--panel-border); }
+#hud button{
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid var(--panel-border);
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+#hud button:active{ background: var(--panel-border); }
+
+/* Permission screen */
+#permission-screen{
+  position: fixed; inset: 0; z-index: 30;
+  display: flex; align-items: center; justify-content: center;
+  background: radial-gradient(circle at 50% 20%, #1a2236, var(--ink));
+  padding: 24px;
+}
+.permission-card{ max-width: 360px; text-align: center; }
+.permission-card h1{
+  font-size: 26px; margin: 0 0 8px; letter-spacing: 0.02em;
+}
+.permission-card p{ color: var(--text-dim); margin: 6px 0; font-size: 14px; line-height:1.6; }
+.permission-sub{ color: var(--text) !important; }
+#btn-start{
+  margin-top: 18px;
+  width: 100%;
+  padding: 14px;
+  border-radius: 12px;
+  border: none;
+  background: var(--amber);
+  color: #111827;
+  font-weight: 700;
+  font-size: 15px;
+}
+#btn-start:active{ opacity: 0.85; }
+.permission-note{ font-size: 11px !important; margin-top: 14px !important; }
+#permission-screen.hidden{ display: none; }
+.permission-error{
+  color: var(--danger) !important;
+  font-size: 13px !important;
+  border: 1px solid rgba(239,68,68,0.4);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin-top: 14px !important;
+}
+.permission-error.hidden{ display: none; }
+
+/* Loading overlay (initial position fix) */
+#loading-overlay{
+  position: fixed; inset: 0; z-index: 25;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 14px;
+  background: rgba(11,16,32,0.75);
+  backdrop-filter: blur(3px);
+  color: var(--text-dim);
+  font-size: 13px;
+}
+#loading-overlay.hidden{ display: none; }
+.spinner{
+  width: 34px; height: 34px;
+  border: 3px solid var(--panel-border);
+  border-top-color: var(--amber);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin{ to{ transform: rotate(360deg); } }
+
+/* Bottom sheets */
+.sheet{
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+  background: var(--panel);
+  border-top: 1px solid var(--panel-border);
+  border-radius: 18px 18px 0 0;
+  padding: 10px 20px max(20px, env(safe-area-inset-bottom));
+  transform: translateY(0);
+  transition: transform 0.25s ease;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.sheet.hidden{ transform: translateY(110%); }
+.sheet-handle{
+  width: 36px; height: 4px; background: var(--panel-border);
+  border-radius: 2px; margin: 0 auto 14px;
+}
+.sheet h2{ margin: 0 0 8px; font-size: 17px; }
+.sheet p{ color: var(--text-dim); font-size: 14px; line-height: 1.6; }
+.quest-meta{ display:flex; gap: 14px; margin: 10px 0 16px; }
+.quest-meta span{
+  font-size: 13px; color: var(--amber);
+  border: 1px solid var(--amber-dim);
+  padding: 4px 10px; border-radius: 20px;
+}
+.sheet button{
+  width: 100%; padding: 12px; border-radius: 10px;
+  border: 1px solid var(--panel-border); background: transparent;
+  color: var(--text); font-size: 14px;
+}
+
+#log-list{ list-style: none; padding: 0; margin: 0 0 14px; }
+#log-list li{
+  display:flex; justify-content: space-between; gap: 10px;
+  padding: 10px 0; border-bottom: 1px solid var(--panel-border);
+  font-size: 13px; color: var(--text-dim);
+}
+#log-list li .tag{ color: var(--amber); }
+#log-list li:last-child{ border-bottom:none; }
+
+/* Toast */
+#toast{
+  position: fixed; left: 50%; bottom: max(24px, env(safe-area-inset-bottom));
+  transform: translate(-50%, 0);
+  background: var(--amber);
+  color: #111827;
+  padding: 12px 20px;
+  border-radius: 12px;
+  font-weight: 700;
+  font-size: 14px;
+  z-index: 40;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+#toast.hidden{ opacity: 0; transform: translate(-50%, 12px); pointer-events: none; }
+
+/* Leaflet marker tweak */
+.quest-flag-icon{
+  filter: drop-shadow(0 2px 4px rgba(0,0,0,0.5));
+}
+
+/* Leaflet attribution (kept for OSM tile usage policy) */
+.leaflet-control-attribution{
+  background: rgba(17,24,39,0.7) !important;
+  color: var(--text-dim) !important;
+  font-size: 10px !important;
+}
+.leaflet-control-attribution a{ color: var(--text-dim) !important; }

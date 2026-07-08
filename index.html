@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>マチ冒険 - 未踏セル探索</title>
+<meta name="theme-color" content="#111827">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div id="map"></div>
+
+<!-- 上部ステータスバー -->
+<header id="hud">
+  <div class="hud-stat">
+    <span class="hud-label">開放セル</span>
+    <span class="hud-value" id="stat-cells">0</span>
+  </div>
+  <div class="hud-divider"></div>
+  <div class="hud-stat">
+    <span class="hud-label">今日のクエスト</span>
+    <span class="hud-value" id="stat-quest">--</span>
+  </div>
+  <button id="btn-log" aria-label="発見ログを開く">ログ</button>
+</header>
+
+<!-- 位置情報許可前のオーバーレイ -->
+<div id="permission-screen">
+  <div class="permission-card">
+    <h1>マチ冒険</h1>
+    <p>知っている街を、歩くほど広がる冒険の地図に変える。</p>
+    <p class="permission-sub">現在地の使用を許可すると、周辺の未踏セルが見えてきます。</p>
+    <p id="permission-error" class="permission-error hidden"></p>
+    <button id="btn-start">現在地を使って始める</button>
+    <p class="permission-note">位置情報は端末内にのみ保存されます。</p>
+  </div>
+</div>
+
+<!-- 初回測位待ちのローディング -->
+<div id="loading-overlay" class="hidden">
+  <div class="spinner"></div>
+  <p>現在地を取得しています…</p>
+</div>
+
+<!-- クエスト詳細パネル -->
+<div id="quest-panel" class="sheet hidden">
+  <div class="sheet-handle"></div>
+  <h2>今日の勾配クエスト</h2>
+  <p id="quest-desc">周辺を探索するとクエストが見つかります。</p>
+  <div class="quest-meta">
+    <span id="quest-distance"></span>
+    <span id="quest-gradient"></span>
+  </div>
+  <button id="btn-close-quest">閉じる</button>
+</div>
+
+<!-- 発見ログパネル -->
+<div id="log-panel" class="sheet hidden">
+  <div class="sheet-handle"></div>
+  <h2>発見ログ</h2>
+  <ul id="log-list"></ul>
+  <button id="btn-close-log">閉じる</button>
+</div>
+
+<!-- 到達トースト -->
+<div id="toast" class="hidden"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

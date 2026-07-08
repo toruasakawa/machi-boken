@@ -170,6 +170,53 @@ body{
 }
 #toast.hidden{ opacity: 0; transform: translate(-50%, 12px); pointer-events: none; }
 
+/* フロンティア・コンパス */
+#frontier-compass{
+  position: fixed;
+  top: calc(max(12px, env(safe-area-inset-top)) + 66px);
+  left: 12px;
+  z-index: 9;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(17,24,39,0.88);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  padding: 8px 14px;
+  transition: padding 0.25s ease, gap 0.25s ease;
+}
+#frontier-compass.hidden{ display: none; }
+#frontier-compass.collapsed{
+  padding: 8px;
+  gap: 0;
+  cursor: pointer;
+}
+.frontier-arrow{
+  display: inline-block;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--amber);
+  transform: rotate(0deg);
+  transition: transform 0.35s ease;
+}
+.frontier-arrow.hidden{ display: none; }
+.frontier-label{
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+}
+.frontier-label.hidden{ display: none; }
+.frontier-close{
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 0 0 4px;
+}
+.frontier-close.hidden{ display: none; }
+
 /* Leaflet marker tweak */
 .quest-flag-icon{
   filter: drop-shadow(0 2px 4px rgba(0,0,0,0.5));

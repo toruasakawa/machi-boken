@@ -29,6 +29,13 @@
   <button id="btn-log" aria-label="発見ログを開く">ログ</button>
 </header>
 
+<!-- フロンティア・コンパス: 未踏エリアが多い方角を矢印1本で示す -->
+<div id="frontier-compass" class="hidden" role="button" tabindex="0" aria-label="フロンティア・コンパス">
+  <span id="frontier-arrow" class="frontier-arrow">↑</span>
+  <span id="frontier-label" class="frontier-label"></span>
+  <button id="frontier-close" class="frontier-close" aria-label="コンパスを閉じる">×</button>
+</div>
+
 <!-- 位置情報許可前のオーバーレイ -->
 <div id="permission-screen">
   <div class="permission-card">

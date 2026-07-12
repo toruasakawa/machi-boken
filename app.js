@@ -18,11 +18,54 @@ const FRONTIER_COLLAPSE_DISTANCE_M = 30;  // 累積移動がこれを超えた�
 const FRONTIER_RECOMPUTE_DISTANCE_M = 100; // 前回の再計算地点からこれだけ動いたら方角を再計算する
 const FRONTIER_SWITCH_MARGIN = 2; // 新しい方位の未踏セル数が現在の提案より何件以上多ければ切り替えるか（僅差ならちらつき防止のため維持）
 
+// 冒険プリセット: 時間は厳密なタイマーではなく「新しく開放するセル数」の目安として使う。
+// 値を変えたい場合はここだけ調整すればよい。
+const ADVENTURE_PRESETS = {
+  short: { minutes: 5, targetCells: 2 },
+  normal: { minutes: 15, targetCells: 5 },
+  long: { minutes: 30, targetCells: 8 },
+};
+const ADVENTURE_PRESET_ORDER = ["short", "normal", "long"];
+
+// 発見数の節目（累計開放セル数）と演出メッセージ
+const MILESTONE_THRESHOLDS = [1, 5, 10, 25, 50, 100];
+const MILESTONE_MESSAGES = {
+  1: "最初の場所を発見しました。",
+  5: "街が少し広がりました。",
+  10: "知らない道を、正解にしています。",
+  25: "いつもの街に、知らない景色が増えました。",
+  50: "この街の冒険家になってきました。",
+  100: "歩いた分だけ、自分の街になりました。",
+};
+
+// 冒険完了時の一行メッセージ（ランダムに1件選ぶ）
+const COMPLETION_MESSAGES = [
+  "一本違うだけで、街は少し違って見えます。",
+  "今日の寄り道も、正解でした。",
+  "またこの街が、少し広くなりました。",
+  "知らなかった場所が、今日の景色になりました。",
+  "歩いた分だけ、自分の街になっていきます。",
+  "次の発見は、一本隣の道にあるかもしれません。",
+];
+
+// 夜間セーフティ: 端末のローカル時刻ベース（18:00〜翌5:59を夜間とする）
+const NIGHT_START_HOUR = 18;
+const NIGHT_END_HOUR = 6; // この時刻未満は夜間
+
+// 道路標識（方向決定UI）: はじく強さ→回転量の変換や最低保証回転数
+const SIGN_MIN_ROTATIONS = 2;
+const SIGN_MAX_ROTATIONS = 6;
+const SIGN_VELOCITY_TO_ROTATIONS = 900; // deg/s あたりの回転数換算スケール
+const SIGN_OVERSHOOT_DEG = 14; // 停止直前の小さなオーバーシュート量
+// 方角の重み付け: index=フロンティア方位からの円環距離(0=最優先,4=反対)
+const DIRECTION_WEIGHT_BY_DISTANCE = [10, 5, 2, 1, 1];
+
 const STORAGE_KEYS = {
   origin: "am_origin",
   visited: "am_visited",
   quest: "am_quest",
   log: "am_log",
+  milestones: "am_milestones",
 };
 
 /* ---------- ローカルストレージ ヘルパー ---------- */
@@ -138,13 +181,23 @@ function initMap(lat, lon) {
   if (quest) drawQuestMarker(quest);
 }
 
-function drawVisitedCell(ix, iy) {
-  L.rectangle(cellBoundsLatLon(ix, iy), {
+function drawVisitedCell(ix, iy, opts) {
+  const animate = !!(opts && opts.animate) && !prefersReducedMotion();
+  const rect = L.rectangle(cellBoundsLatLon(ix, iy), {
+    className: "cell-rect",
     color: "#f59e0b",
     weight: 1,
     fillColor: "#f59e0b",
-    fillOpacity: 0.28,
+    fillOpacity: animate ? 0 : 0.28,
+    opacity: animate ? 0 : 1,
   }).addTo(cellsLayer);
+
+  if (animate) {
+    requestAnimationFrame(() => {
+      rect.setStyle({ fillOpacity: 0.28, opacity: 1 });
+    });
+  }
+  return rect;
 }
 
 function drawQuestMarker(q) {
@@ -171,12 +224,18 @@ function updateHud(currentLat, currentLon) {
   }
 }
 
-function showToast(msg) {
+function showToast(msg, variant) {
   const t = el("toast");
   t.textContent = msg;
   t.classList.remove("hidden");
+  t.classList.toggle("toast-milestone", variant === "milestone");
   clearTimeout(showToast._timer);
-  showToast._timer = setTimeout(() => t.classList.add("hidden"), 2600);
+  const duration = variant === "milestone" ? 3400 : 2600;
+  showToast._timer = setTimeout(() => t.classList.add("hidden"), duration);
+}
+
+function prefersReducedMotion() {
+  return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 }
 
 function openQuestPanel() {
@@ -459,6 +518,462 @@ function updateFrontierCompassFlow(lat, lon, reliable) {
   }
 }
 
+/* ==========================================================
+   冒険セッション状態
+   ========================================================== */
+const adventureState = {
+  status: "idle", // idle | choosingDuration | choosingDirection | active | completed
+  preset: null,
+  targetCells: 0,
+  discoveredCells: 0,
+  direction: null, // {sector, label, bearingDeg}
+  startedAt: null,
+  startLatLon: null, // 冒険開始地点（帰り道用）
+  targetReached: false,
+};
+
+function renderAdventureUI() {
+  const s = adventureState.status;
+  el("duration-panel").classList.toggle("hidden", s !== "choosingDuration");
+  el("direction-panel").classList.toggle("hidden", s !== "choosingDirection");
+  el("adventure-hud").classList.toggle("hidden", s !== "active");
+  el("completion-sheet").classList.toggle("hidden", s !== "completed");
+  el("btn-begin-adventure").classList.toggle("hidden", !(s === "idle" || s === "completed"));
+}
+
+function setAdventureStatus(status) {
+  adventureState.status = status;
+  renderAdventureUI();
+}
+
+function resetAdventureStateKeepHistory() {
+  adventureState.preset = null;
+  adventureState.targetCells = 0;
+  adventureState.discoveredCells = 0;
+  adventureState.direction = null;
+  adventureState.startedAt = null;
+  adventureState.startLatLon = null;
+  adventureState.targetReached = false;
+}
+
+function renderAdventureHud() {
+  if (!adventureState.direction) return;
+  el("adventure-hud-direction").textContent = `${adventureState.direction.label}へ冒険中`;
+  el("adventure-hud-progress").textContent =
+    `新しい場所 ${adventureState.discoveredCells} / ${adventureState.targetCells}`;
+}
+
+// アプリ起動後、初回の位置取得・地図準備が完了した直後に一度だけ呼ばれる（handlePosition内）。
+// それ以外に、地図画面の「冒険開始」ボタンからも同じ入口を使う。
+function beginAdventureFlow() {
+  if (adventureState.status !== "idle" && adventureState.status !== "completed") return;
+  if (isNightTime()) {
+    showNightWarning();
+  } else {
+    showDurationPanel({ nightRestricted: false });
+  }
+}
+
+function endAdventure() {
+  if (adventureState.status !== "active") return;
+  setAdventureStatus("completed");
+  showCompletionSheet();
+}
+
+/* ---------- 夜間セーフティ ----------
+   将来、緯度経度から日没時刻を算出できるよう判定はisNightTime()にまとめる。
+   現状は端末のローカル時刻のみを使用（外部の日没API等は導入しない）。 */
+function isNightTime(date) {
+  const d = date || new Date();
+  const h = d.getHours();
+  return h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR;
+}
+
+function showNightWarning() {
+  const panel = el("night-warning-panel");
+  panel.classList.remove("hidden");
+  const firstBtn = panel.querySelector("button");
+  if (firstBtn) firstBtn.focus();
+}
+
+function hideNightWarning() {
+  el("night-warning-panel").classList.add("hidden");
+}
+
+/* ---------- 冒険時間選択 ---------- */
+function renderDurationOptions() {
+  ADVENTURE_PRESET_ORDER.forEach((key) => {
+    const preset = ADVENTURE_PRESETS[key];
+    const btn = document.querySelector(`.duration-option[data-preset="${key}"]`);
+    if (!btn) return;
+    btn.querySelector(".duration-minutes").textContent = `${preset.minutes}分`;
+    btn.querySelector(".duration-desc").textContent = `新しい場所を${preset.targetCells}つ`;
+  });
+}
+
+function showDurationPanel(opts) {
+  const nightRestricted = !!(opts && opts.nightRestricted) || isNightTime();
+  el("duration-option-normal").classList.toggle("hidden", nightRestricted);
+  el("duration-option-long").classList.toggle("hidden", nightRestricted);
+  setAdventureStatus("choosingDuration");
+  const firstVisible = document.querySelector(".duration-option:not(.hidden)");
+  if (firstVisible) firstVisible.focus();
+}
+
+function selectAdventurePreset(presetKey) {
+  const preset = ADVENTURE_PRESETS[presetKey];
+  if (!preset) return;
+  adventureState.preset = presetKey;
+  adventureState.targetCells = preset.targetCells;
+  adventureState.discoveredCells = 0;
+  adventureState.targetReached = false;
+  showDirectionPanel();
+}
+
+/* ---------- 道路標識・方向決定UI ----------
+   フロンティア・コンパスの方位判定ロジック(computeFrontierDirection)を
+   そのまま流用し、優先方向を中心に揺らぎを持たせた重み付き抽選で方角を選ぶ。 */
+let signSpinning = false;
+let signDragState = null;
+let currentSignRotation = 0;
+let signAnimationFrameId = null;
+
+function pickWeightedDirectionSector(frontierResult) {
+  const hasFrontier = frontierResult && frontierResult.hasFrontier;
+  const weights = [];
+  for (let s = 0; s < 8; s++) {
+    if (!hasFrontier) {
+      weights.push(1); // 未踏エリアの偏りが無ければ均等ランダム
+      continue;
+    }
+    const raw = Math.abs(s - frontierResult.sector);
+    const dist = Math.min(raw, 8 - raw);
+    weights.push(DIRECTION_WEIGHT_BY_DISTANCE[dist]);
+  }
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * total;
+  for (let s = 0; s < 8; s++) {
+    r -= weights[s];
+    if (r <= 0) return s;
+  }
+  return 0;
+}
+
+function getSignBoardCenter() {
+  const rect = el("sign-board").getBoundingClientRect();
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
+function angleFromCenter(clientX, clientY, center) {
+  return (Math.atan2(clientY - center.y, clientX - center.x) * 180) / Math.PI;
+}
+
+function normalizeAngleDelta(delta) {
+  let d = delta % 360;
+  if (d > 180) d -= 360;
+  if (d < -180) d += 360;
+  return d;
+}
+
+function applySignRotation(deg) {
+  el("sign-board").style.transform = `rotate(${deg}deg)`;
+}
+
+function cancelSignAnimation() {
+  if (signAnimationFrameId != null) {
+    cancelAnimationFrame(signAnimationFrameId);
+    signAnimationFrameId = null;
+  }
+  signSpinning = false;
+}
+
+function computeFinalRotation(current, targetBearingDeg, spinSign, rotations) {
+  const currentMod = ((current % 360) + 360) % 360;
+  const deltaCW = (targetBearingDeg - currentMod + 360) % 360;
+  const delta = spinSign >= 0 ? deltaCW : deltaCW === 0 ? 0 : deltaCW - 360;
+  return current + spinSign * rotations * 360 + delta;
+}
+
+function onSignPointerDown(e) {
+  if (signSpinning) return;
+  cancelSignAnimation();
+  const board = el("sign-board");
+  try {
+    board.setPointerCapture(e.pointerId);
+  } catch (err) {
+    // ポインターキャプチャ非対応でも操作自体は継続する
+  }
+  const center = getSignBoardCenter();
+  const angle = angleFromCenter(e.clientX, e.clientY, center);
+  signDragState = {
+    center,
+    lastAngle: angle,
+    cumulativeDelta: 0,
+    startRotation: currentSignRotation,
+    history: [{ t: performance.now(), rotation: currentSignRotation }],
+  };
+  board.classList.add("dragging");
+}
+
+function onSignPointerMove(e) {
+  if (!signDragState) return;
+  const angle = angleFromCenter(e.clientX, e.clientY, signDragState.center);
+  const delta = normalizeAngleDelta(angle - signDragState.lastAngle);
+  signDragState.lastAngle = angle;
+  signDragState.cumulativeDelta += delta;
+  currentSignRotation = signDragState.startRotation + signDragState.cumulativeDelta;
+  applySignRotation(currentSignRotation);
+  const now = performance.now();
+  signDragState.history.push({ t: now, rotation: currentSignRotation });
+  while (signDragState.history.length > 2 && now - signDragState.history[0].t > 200) {
+    signDragState.history.shift();
+  }
+}
+
+function onSignPointerUp(e) {
+  if (!signDragState) return;
+  const board = el("sign-board");
+  try {
+    board.releasePointerCapture(e.pointerId);
+  } catch (err) {
+    // 無視して継続
+  }
+  board.classList.remove("dragging");
+  const history = signDragState.history;
+  const first = history[0];
+  const last = history[history.length - 1];
+  const dt = last.t - first.t;
+  const velocityDegPerMs = dt > 8 ? (last.rotation - first.rotation) / dt : 0;
+  signDragState = null;
+  triggerSignSpin({ velocityDegPerSec: velocityDegPerMs * 1000 });
+}
+
+function triggerSignSpin(opts) {
+  if (signSpinning) return;
+  const refLatLon = lastKnownLatLon || (origin ? { lat: origin.lat0, lon: origin.lon0 } : null);
+  const frontier = refLatLon
+    ? compassResult && compassResult.hasFrontier
+      ? compassResult
+      : computeFrontierDirection(refLatLon.lat, refLatLon.lon)
+    : { hasFrontier: false };
+  const targetSector = pickWeightedDirectionSector(frontier);
+
+  const v = opts && opts.velocityDegPerSec != null ? opts.velocityDegPerSec : 0;
+  const spinSign = v !== 0 ? Math.sign(v) : Math.random() < 0.5 ? -1 : 1;
+  const absV = Math.abs(v);
+  let rotations = Math.round(absV / SIGN_VELOCITY_TO_ROTATIONS);
+  rotations = Math.max(SIGN_MIN_ROTATIONS, Math.min(SIGN_MAX_ROTATIONS, rotations || SIGN_MIN_ROTATIONS));
+
+  animateSignSpin(targetSector, spinSign, rotations);
+}
+
+function animateSignSpin(targetSector, spinSign, rotations) {
+  const targetBearingDeg = targetSector * 45;
+  const startRotation = currentSignRotation;
+  const finalRotation = computeFinalRotation(startRotation, targetBearingDeg, spinSign, rotations);
+  const reducedMotion = prefersReducedMotion();
+
+  signSpinning = true;
+  el("sign-board").classList.add("spinning");
+
+  if (reducedMotion) {
+    currentSignRotation = finalRotation;
+    applySignRotation(currentSignRotation);
+    setTimeout(() => {
+      signSpinning = false;
+      el("sign-board").classList.remove("spinning");
+      onSignSettled(targetSector);
+    }, 260);
+    return;
+  }
+
+  const overshoot = spinSign * SIGN_OVERSHOOT_DEG;
+  const overshootRotation = finalRotation + overshoot;
+  const duration = Math.max(700, Math.min(3200, rotations * 260 + 500));
+  const settleDuration = 260;
+  const startTime = performance.now();
+
+  function easeOutCubic(t) {
+    return 1 - Math.pow(1 - t, 3);
+  }
+
+  function step(now) {
+    const elapsed = now - startTime;
+    if (elapsed < duration) {
+      const t = elapsed / duration;
+      currentSignRotation = startRotation + (overshootRotation - startRotation) * easeOutCubic(t);
+      applySignRotation(currentSignRotation);
+      signAnimationFrameId = requestAnimationFrame(step);
+      return;
+    }
+    const settleElapsed = elapsed - duration;
+    if (settleElapsed < settleDuration) {
+      const t = settleElapsed / settleDuration;
+      const wobble = Math.sin(t * Math.PI * 2.5) * SIGN_OVERSHOOT_DEG * 0.5 * (1 - t);
+      currentSignRotation = overshootRotation + (finalRotation - overshootRotation) * t + wobble;
+      applySignRotation(currentSignRotation);
+      signAnimationFrameId = requestAnimationFrame(step);
+      return;
+    }
+    currentSignRotation = finalRotation;
+    applySignRotation(currentSignRotation);
+    signSpinning = false;
+    el("sign-board").classList.remove("spinning");
+    signAnimationFrameId = null;
+    onSignSettled(targetSector);
+  }
+
+  signAnimationFrameId = requestAnimationFrame(step);
+}
+
+function onSignSettled(sector) {
+  const label = COMPASS_LABELS[sector];
+  adventureState.direction = { sector, label, bearingDeg: sector * 45 };
+  el("sign-board").setAttribute("aria-label", `方向標識、決定した方角は${label}`);
+  el("direction-result-text").textContent = `今日は${label}へ。`;
+  el("direction-result-sub").textContent = "最初の200〜300mだけ、この方向を意識してみよう。";
+  el("direction-result").classList.remove("hidden");
+  const confirmBtn = el("btn-confirm-direction");
+  if (confirmBtn) confirmBtn.focus();
+}
+
+function showDirectionPanel() {
+  setAdventureStatus("choosingDirection");
+  el("direction-result").classList.add("hidden");
+  el("direction-hint").textContent = isNightTime()
+    ? "明るく、人通りのある道を選んでください。標識をはじいて方角を決めよう。"
+    : "標識をはじいて、今日進む方角を決めよう。";
+}
+
+function redoDirection() {
+  el("direction-result").classList.add("hidden");
+  adventureState.direction = null;
+  const spinBtn = el("btn-spin-sign");
+  if (spinBtn) spinBtn.focus();
+}
+
+function confirmDirection() {
+  if (!adventureState.direction) return;
+  adventureState.startedAt = Date.now();
+  adventureState.startLatLon = lastKnownLatLon ? { ...lastKnownLatLon } : null;
+  compassState = "collapsed";
+  renderCompass();
+  setAdventureStatus("active");
+  renderAdventureHud();
+  showToast(`${adventureState.direction.label}へ冒険開始！`);
+}
+
+/* ---------- セル発見リアクション ----------
+   将来SEを追加しやすいよう、視覚・文言・振動のリアクションを一箇所にまとめる。 */
+function handleCellDiscoveryFeedback(ix, iy) {
+  drawVisitedCell(ix, iy, { animate: true });
+  showToast("新しい場所を発見！");
+  pushLog("cell", `セル開放 (${ix},${iy})`);
+
+  try {
+    if ("vibrate" in navigator) navigator.vibrate(30);
+  } catch (e) {
+    // 振動非対応・失敗しても本体は継続する
+  }
+
+  if (adventureState.status === "active") {
+    adventureState.discoveredCells++;
+    renderAdventureHud();
+    if (!adventureState.targetReached && adventureState.discoveredCells >= adventureState.targetCells) {
+      adventureState.targetReached = true;
+      setTimeout(() => showToast("今日の冒険を達成しました！"), 900);
+    }
+  }
+}
+
+/* ---------- 発見数の節目 ---------- */
+function checkMilestones() {
+  try {
+    const total = Object.keys(visited).length;
+    const displayed = store.get(STORAGE_KEYS.milestones, []);
+    const newlyReached = MILESTONE_THRESHOLDS.filter((t) => total >= t && !displayed.includes(t));
+    if (newlyReached.length === 0) return;
+    const toCelebrate = newlyReached[newlyReached.length - 1];
+    store.set(STORAGE_KEYS.milestones, [...displayed, ...newlyReached]);
+    showMilestoneCelebration(toCelebrate);
+  } catch (e) {
+    // 節目演出に失敗してもアプリ本体は継続する
+  }
+}
+
+function showMilestoneCelebration(threshold) {
+  const msg = MILESTONE_MESSAGES[threshold] || "新しい節目に到達しました。";
+  showToast(msg, "milestone");
+  pushLog("milestone", msg);
+  try {
+    spawnConfetti();
+  } catch (e) {
+    // 紙吹雪の失敗は無視して継続する
+  }
+}
+
+function spawnConfetti() {
+  if (prefersReducedMotion()) return;
+  const layer = el("confetti-layer");
+  if (!layer) return;
+  const colors = ["#f59e0b", "#fbbf24", "#facc15", "#e5e7eb", "#60a5fa"];
+  const count = 18;
+  for (let i = 0; i < count; i++) {
+    const piece = document.createElement("span");
+    piece.className = "confetti-piece";
+    piece.style.left = `${Math.random() * 100}%`;
+    piece.style.background = colors[i % colors.length];
+    piece.style.animationDelay = `${Math.random() * 150}ms`;
+    piece.style.setProperty("--drift", `${(Math.random() - 0.5) * 120}px`);
+    piece.style.setProperty("--rot", `${(Math.random() - 0.5) * 720}deg`);
+    layer.appendChild(piece);
+    setTimeout(() => piece.remove(), 1500);
+  }
+}
+
+/* ---------- 冒険完了シート ---------- */
+function showCompletionSheet() {
+  const preset = adventureState.preset ? ADVENTURE_PRESETS[adventureState.preset] : null;
+  el("completion-duration").textContent = preset ? `${preset.minutes}分` : "--";
+  el("completion-direction").textContent = adventureState.direction ? adventureState.direction.label : "--";
+  el("completion-session-cells").textContent = `${adventureState.discoveredCells}`;
+  el("completion-total-cells").textContent = `${Object.keys(visited).length}`;
+  const msg = COMPLETION_MESSAGES[Math.floor(Math.random() * COMPLETION_MESSAGES.length)];
+  el("completion-message").textContent = msg;
+  const firstBtn = el("completion-sheet").querySelector("button");
+  if (firstBtn) firstBtn.focus();
+}
+
+function openWayHome() {
+  try {
+    if (!adventureState.startLatLon) {
+      showToast("開始地点の記録がありません");
+      return;
+    }
+    const dest = `${adventureState.startLatLon.lat},${adventureState.startLatLon.lon}`;
+    let url = `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(dest)}&travelmode=walking`;
+    if (lastKnownLatLon) {
+      const originParam = `${lastKnownLatLon.lat},${lastKnownLatLon.lon}`;
+      url += `&origin=${encodeURIComponent(originParam)}`;
+    }
+    window.open(url, "_blank", "noopener");
+  } catch (e) {
+    showToast("帰り道を開けませんでした");
+  }
+}
+
+function continueAdventure() {
+  el("completion-sheet").classList.add("hidden");
+  resetAdventureStateKeepHistory();
+  setAdventureStatus("idle");
+  beginAdventureFlow();
+}
+
+function finishToday() {
+  resetAdventureStateKeepHistory();
+  setAdventureStatus("idle");
+}
+
 /* ---------- 位置情報の処理 ---------- */
 let lastAccuracyWarnAt = 0;
 
@@ -472,6 +987,12 @@ function handlePosition(pos) {
 
   if (!map) {
     initMap(lat, lon);
+    try {
+      // 初回の位置取得・地図準備が完了した直後に、冒険時間選択へ自動で進む。
+      beginAdventureFlow();
+    } catch (e) {
+      console.error(e);
+    }
   } else {
     meMarker.setLatLng([lat, lon]);
   }
@@ -496,9 +1017,8 @@ function handlePosition(pos) {
     if (!visited[key]) {
       visited[key] = { ts: Date.now(), lat, lon };
       store.set(STORAGE_KEYS.visited, visited);
-      drawVisitedCell(ix, iy);
-      showToast("新しいセルを開放した");
-      pushLog("cell", `セル開放 (${ix},${iy})`);
+      handleCellDiscoveryFeedback(ix, iy);
+      checkMilestones();
     }
 
     if (quest && quest.ix === ix && quest.iy === iy) {
@@ -601,6 +1121,44 @@ window.addEventListener("DOMContentLoaded", () => {
     e.stopPropagation();
     hideCompassForSession();
   });
+
+  // ---- 冒険セッション: 初期表示 ----
+  renderDurationOptions();
+  renderAdventureUI();
+
+  // ---- 冒険時間選択 ----
+  document.querySelectorAll(".duration-option").forEach((btn) => {
+    btn.addEventListener("click", () => selectAdventurePreset(btn.dataset.preset));
+  });
+
+  // ---- 道路標識（方向決定） ----
+  const signBoard = el("sign-board");
+  signBoard.addEventListener("pointerdown", onSignPointerDown);
+  signBoard.addEventListener("pointermove", onSignPointerMove);
+  signBoard.addEventListener("pointerup", onSignPointerUp);
+  signBoard.addEventListener("pointercancel", onSignPointerUp);
+  el("btn-spin-sign").addEventListener("click", () => triggerSignSpin({ velocityDegPerSec: null }));
+  el("btn-redo-direction").addEventListener("click", redoDirection);
+  el("btn-confirm-direction").addEventListener("click", confirmDirection);
+
+  // ---- 夜間セーフティ ----
+  el("btn-night-cancel").addEventListener("click", () => {
+    hideNightWarning();
+    setAdventureStatus("idle");
+  });
+  el("btn-night-continue").addEventListener("click", () => {
+    hideNightWarning();
+    showDurationPanel({ nightRestricted: true });
+  });
+
+  // ---- 冒険開始・終了 ----
+  el("btn-begin-adventure").addEventListener("click", beginAdventureFlow);
+  el("btn-end-adventure").addEventListener("click", endAdventure);
+
+  // ---- 冒険完了シート ----
+  el("btn-open-way-home").addEventListener("click", openWayHome);
+  el("btn-continue-adventure").addEventListener("click", continueAdventure);
+  el("btn-finish-today").addEventListener("click", finishToday);
 
   // 既に許可済みなら初期画面を出さずに即開始（Permissions APIが使える場合のみ）
   if (navigator.permissions && navigator.permissions.query) {

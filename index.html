@@ -26,6 +26,7 @@
     <span class="hud-label">今日のクエスト</span>
     <span class="hud-value" id="stat-quest">--</span>
   </div>
+  <button id="btn-begin-adventure" aria-label="冒険を始める">冒険開始</button>
   <button id="btn-log" aria-label="発見ログを開く">ログ</button>
 </header>
 
@@ -36,11 +37,20 @@
   <button id="frontier-close" class="frontier-close" aria-label="コンパスを閉じる">×</button>
 </div>
 
+<!-- 冒険中の進捗HUD -->
+<div id="adventure-hud" class="hidden">
+  <div class="adventure-hud-row">
+    <span id="adventure-hud-direction" class="adventure-hud-direction"></span>
+    <span id="adventure-hud-progress" class="adventure-hud-progress"></span>
+  </div>
+  <button id="btn-end-adventure" class="adventure-end-btn" type="button">冒険を終える</button>
+</div>
+
 <!-- 位置情報許可前のオーバーレイ -->
 <div id="permission-screen">
   <div class="permission-card">
     <h1>マチ冒険</h1>
-    <p>知っている街を、歩くほど広がる冒険の地図に変える。</p>
+    <p class="tagline">知らない道を、正解にする。</p>
     <p class="permission-sub">現在地の使用を許可すると、周辺の未踏セルが見えてきます。</p>
     <p id="permission-error" class="permission-error hidden"></p>
     <button id="btn-start">現在地を使って始める</button>
@@ -52,6 +62,79 @@
 <div id="loading-overlay" class="hidden">
   <div class="spinner"></div>
   <p>現在地を取得しています…</p>
+</div>
+
+<!-- 夜間セーフティ警告 -->
+<div id="night-warning-panel" class="hidden" role="dialog" aria-modal="true" aria-labelledby="night-warning-title">
+  <div class="night-warning-card">
+    <h2 id="night-warning-title">夜の冒険は、安全第一。</h2>
+    <p>知らない道を歩く冒険は、明るい時間をおすすめしています。</p>
+    <div class="night-warning-actions">
+      <button id="btn-night-cancel" type="button">今日はやめる</button>
+      <button id="btn-night-continue" type="button">それでも短い冒険を始める</button>
+    </div>
+  </div>
+</div>
+
+<!-- 冒険時間選択パネル -->
+<div id="duration-panel" class="sheet hidden" role="dialog" aria-modal="true" aria-labelledby="duration-title">
+  <div class="sheet-handle"></div>
+  <h2 id="duration-title">今日はどれくらい冒険する？</h2>
+  <div class="duration-options">
+    <button class="duration-option" type="button" data-preset="short">
+      <span class="duration-minutes"></span>
+      <span class="duration-desc"></span>
+    </button>
+    <button class="duration-option" type="button" data-preset="normal" id="duration-option-normal">
+      <span class="duration-minutes"></span>
+      <span class="duration-desc"></span>
+    </button>
+    <button class="duration-option" type="button" data-preset="long" id="duration-option-long">
+      <span class="duration-minutes"></span>
+      <span class="duration-desc"></span>
+    </button>
+  </div>
+</div>
+
+<!-- 道路標識: 方向決定UI -->
+<div id="direction-panel" class="hidden" role="dialog" aria-modal="true" aria-labelledby="direction-title">
+  <div class="direction-panel-inner">
+    <h2 id="direction-title">冒険の方向を決めよう</h2>
+    <p id="direction-hint" class="direction-hint">標識をはじいて、今日進む方角を決めよう。</p>
+    <div class="sign-stage">
+      <div class="sign-post"></div>
+      <div id="sign-board" class="sign-board" aria-hidden="true">
+        <span class="sign-arrow">↑</span>
+      </div>
+    </div>
+    <button id="btn-spin-sign" class="sign-spin-btn" type="button">標識を回す</button>
+    <div id="direction-result" class="direction-result hidden">
+      <p id="direction-result-text" class="direction-result-text"></p>
+      <p id="direction-result-sub" class="direction-result-sub"></p>
+      <div class="direction-actions">
+        <button id="btn-redo-direction" class="btn-secondary" type="button">もう一度決める</button>
+        <button id="btn-confirm-direction" class="btn-primary" type="button">この方向で冒険開始</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 冒険完了シート -->
+<div id="completion-sheet" class="sheet hidden" role="dialog" aria-modal="true" aria-labelledby="completion-title">
+  <div class="sheet-handle"></div>
+  <h2 id="completion-title">今日の冒険、おつかれさま！</h2>
+  <ul class="completion-stats">
+    <li><span class="completion-label">選んだ時間</span><span id="completion-duration"></span></li>
+    <li><span class="completion-label">決定した方向</span><span id="completion-direction"></span></li>
+    <li><span class="completion-label">今回発見した新しい場所</span><span id="completion-session-cells"></span></li>
+    <li><span class="completion-label">累計発見した場所</span><span id="completion-total-cells"></span></li>
+  </ul>
+  <p id="completion-message" class="completion-message"></p>
+  <div class="completion-actions">
+    <button id="btn-open-way-home" type="button">帰り道を開く</button>
+    <button id="btn-continue-adventure" type="button">帰りも冒険する</button>
+    <button id="btn-finish-today" type="button">今日は終わる</button>
+  </div>
 </div>
 
 <!-- クエスト詳細パネル -->
@@ -76,6 +159,9 @@
 
 <!-- 到達トースト -->
 <div id="toast" class="hidden"></div>
+
+<!-- 発見数の節目演出（紙吹雪） -->
+<div id="confetti-layer" aria-hidden="true"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="app.js"></script>

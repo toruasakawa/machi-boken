@@ -56,6 +56,7 @@ body{
   font-size: 13px;
 }
 #hud button:active{ background: var(--panel-border); }
+#btn-begin-adventure.hidden{ display: none; }
 
 /* Permission screen */
 #permission-screen{
@@ -69,6 +70,7 @@ body{
   font-size: 26px; margin: 0 0 8px; letter-spacing: 0.02em;
 }
 .permission-card p{ color: var(--text-dim); margin: 6px 0; font-size: 14px; line-height:1.6; }
+.tagline{ color: var(--amber) !important; font-weight: 700; font-size: 15px !important; }
 .permission-sub{ color: var(--text) !important; }
 #btn-start{
   margin-top: 18px;
@@ -216,6 +218,195 @@ body{
   padding: 0 0 0 4px;
 }
 .frontier-close.hidden{ display: none; }
+
+/* 冒険中の進捗HUD */
+#adventure-hud{
+  position: fixed;
+  top: calc(max(12px, env(safe-area-inset-top)) + 112px);
+  left: 12px;
+  right: 12px;
+  z-index: 9;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(17,24,39,0.88);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+#adventure-hud.hidden{ display: none; }
+.adventure-hud-row{
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 13px;
+}
+.adventure-hud-direction{ color: var(--amber); font-weight: 700; }
+.adventure-hud-progress{ color: var(--text-dim); }
+.adventure-end-btn{
+  align-self: flex-end;
+  padding: 6px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--panel-border);
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+}
+
+/* 夜間セーフティ警告 */
+#night-warning-panel{
+  position: fixed; inset: 0; z-index: 33;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(11,16,32,0.92);
+  padding: 24px;
+}
+#night-warning-panel.hidden{ display: none; }
+.night-warning-card{ max-width: 340px; text-align: center; }
+.night-warning-card h2{ font-size: 20px; margin: 0 0 10px; }
+.night-warning-card p{ color: var(--text-dim); font-size: 14px; line-height: 1.6; margin: 0 0 20px; }
+.night-warning-actions{ display: flex; flex-direction: column; gap: 10px; }
+.night-warning-actions button{ padding: 12px; border-radius: 10px; font-size: 14px; }
+#btn-night-cancel{ border: 1px solid var(--panel-border); background: transparent; color: var(--text); }
+#btn-night-continue{ border: none; background: var(--amber); color: #111827; font-weight: 700; }
+
+/* 冒険時間選択パネル */
+.duration-options{ display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+.duration-option{
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; padding: 14px 16px; border-radius: 12px;
+  border: 1px solid var(--panel-border); background: rgba(255,255,255,0.03);
+  color: var(--text); text-align: left;
+}
+.duration-option:active{ background: var(--panel-border); }
+.duration-option.hidden{ display: none; }
+.duration-minutes{ font-size: 17px; font-weight: 700; color: var(--amber); }
+.duration-desc{ font-size: 13px; color: var(--text-dim); }
+
+/* 道路標識: 方向決定UI */
+#direction-panel{
+  position: fixed; inset: 0; z-index: 32;
+  display: flex; align-items: center; justify-content: center;
+  background: radial-gradient(circle at 50% 30%, #1a2236, var(--ink));
+  padding: 24px;
+}
+#direction-panel.hidden{ display: none; }
+.direction-panel-inner{ max-width: 360px; width: 100%; text-align: center; }
+.direction-panel-inner h2{ font-size: 22px; margin: 0 0 8px; }
+.direction-hint{ color: var(--text-dim); font-size: 14px; margin: 0 0 20px; line-height: 1.6; min-height: 2.6em; }
+
+.sign-stage{
+  position: relative;
+  width: 200px; height: 240px;
+  margin: 0 auto 18px;
+  touch-action: none;
+}
+.sign-post{
+  position: absolute;
+  left: 50%; bottom: 0;
+  width: 10px; height: 140px;
+  margin-left: -5px;
+  background: linear-gradient(180deg, #4b5563, #374151);
+  border-radius: 4px;
+}
+.sign-board{
+  position: absolute;
+  left: 50%; top: 0;
+  width: 148px; height: 148px;
+  margin-left: -74px;
+  border-radius: 26px;
+  background: linear-gradient(160deg, var(--amber), #d97706);
+  border: 4px solid #fde68a;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 10px 24px rgba(0,0,0,0.4);
+  cursor: grab;
+  touch-action: none;
+  transform: rotate(0deg);
+  will-change: transform;
+}
+.sign-board.dragging{ cursor: grabbing; }
+.sign-board.spinning{ cursor: default; }
+.sign-arrow{
+  font-size: 56px;
+  color: #111827;
+  line-height: 1;
+  user-select: none;
+  pointer-events: none;
+}
+.sign-spin-btn{
+  display: block;
+  margin: 0 auto 8px;
+  padding: 10px 18px;
+  border-radius: 10px;
+  border: 1px solid var(--panel-border);
+  background: rgba(255,255,255,0.06);
+  color: var(--text);
+  font-size: 13px;
+}
+.direction-result{ margin-top: 18px; }
+.direction-result.hidden{ display: none; }
+.direction-result-text{ font-size: 19px; font-weight: 700; margin: 0 0 4px; }
+.direction-result-sub{ font-size: 13px; color: var(--text-dim); margin: 0 0 18px; }
+.direction-actions{ display: flex; gap: 10px; }
+.btn-primary, .btn-secondary{
+  flex: 1; padding: 12px; border-radius: 10px; font-size: 14px;
+}
+.btn-primary{ border: none; background: var(--amber); color: #111827; font-weight: 700; }
+.btn-secondary{ border: 1px solid var(--panel-border); background: transparent; color: var(--text); }
+
+/* 冒険完了シート */
+.completion-stats{ list-style: none; padding: 0; margin: 4px 0 14px; }
+.completion-stats li{
+  display: flex; justify-content: space-between; gap: 10px;
+  padding: 8px 0; border-bottom: 1px solid var(--panel-border);
+  font-size: 13px;
+}
+.completion-stats li:last-child{ border-bottom: none; }
+.completion-label{ color: var(--text-dim); }
+.completion-message{
+  color: var(--amber); font-size: 14px; font-weight: 700;
+  margin: 0 0 16px; line-height: 1.6;
+}
+.completion-actions{ display: flex; flex-direction: column; gap: 10px; }
+#btn-open-way-home, #btn-continue-adventure{
+  border: 1px solid var(--panel-border); background: transparent; color: var(--text);
+}
+#btn-finish-today{ border: none; background: var(--amber); color: #111827; font-weight: 700; }
+
+/* 発見トーストの節目バリアント */
+#toast.toast-milestone{
+  font-size: 16px;
+  padding: 16px 26px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.55);
+}
+
+/* 発見数の節目演出（紙吹雪） */
+#confetti-layer{
+  position: fixed; inset: 0; z-index: 45;
+  pointer-events: none;
+  overflow: hidden;
+}
+.confetti-piece{
+  position: absolute;
+  top: -10px;
+  width: 8px; height: 14px;
+  border-radius: 2px;
+  opacity: 0.95;
+  animation: confetti-fall 1.4s ease-in forwards;
+}
+@keyframes confetti-fall{
+  0%{ transform: translate(0, 0) rotate(0deg); opacity: 1; }
+  100%{ transform: translate(var(--drift, 0px), 360px) rotate(var(--rot, 360deg)); opacity: 0; }
+}
+
+/* 新規セル開放時の色の広がり */
+.cell-rect{ transition: fill-opacity 0.55s ease, opacity 0.55s ease; }
+
+/* prefers-reduced-motion: 高速回転・紙吹雪・広がりアニメーションを簡略化 */
+@media (prefers-reduced-motion: reduce){
+  .cell-rect{ transition: none; }
+  .frontier-arrow{ transition: none; }
+  #frontier-compass{ transition: none; }
+  .confetti-piece{ display: none; }
+}
 
 /* Leaflet marker tweak */
 .quest-flag-icon{

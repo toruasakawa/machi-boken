@@ -66,7 +66,13 @@ const STORAGE_KEYS = {
   quest: "am_quest",
   log: "am_log",
   milestones: "am_milestones",
+  privacyAck: "am_share_privacy_ack",
 };
+
+// 共有カードのシルエット表示: グリッド1マスあたりの最大/最小ピクセル数
+const SHAPE_GRID_MAX_PX = 220;
+const SHAPE_GRID_MAX_CELL_PX = 34;
+const SHAPE_GRID_MIN_CELL_PX = 14;
 
 /* ---------- ローカルストレージ ヘルパー ---------- */
 const store = {
@@ -172,13 +178,23 @@ function initMap(lat, lon) {
     weight: 2,
   }).addTo(map);
 
-  // 既に保存済みのセルを再描画
+  // 既に保存済みのセルを再描画（1件でも壊れたデータがあっても地図初期化全体を止めない）
   Object.keys(visited).forEach((key) => {
-    const [ix, iy] = key.split("_").map(Number);
-    drawVisitedCell(ix, iy);
+    try {
+      const [ix, iy] = key.split("_").map(Number);
+      drawVisitedCell(ix, iy);
+    } catch (e) {
+      console.error("failed to restore visited cell", key, e);
+    }
   });
 
-  if (quest) drawQuestMarker(quest);
+  if (quest) {
+    try {
+      drawQuestMarker(quest);
+    } catch (e) {
+      console.error("failed to restore quest marker", e);
+    }
+  }
 }
 
 function drawVisitedCell(ix, iy, opts) {
@@ -530,6 +546,7 @@ const adventureState = {
   startedAt: null,
   startLatLon: null, // 冒険開始地点（帰り道用）
   targetReached: false,
+  sessionDiscoveredCellIds: [], // 今回のセッションで新規開放したセル {ix,iy}（共有カードのシルエット表示専用。重複追加はしない）
 };
 
 function renderAdventureUI() {
@@ -554,6 +571,7 @@ function resetAdventureStateKeepHistory() {
   adventureState.startedAt = null;
   adventureState.startLatLon = null;
   adventureState.targetReached = false;
+  adventureState.sessionDiscoveredCellIds = [];
 }
 
 function renderAdventureHud() {
@@ -829,10 +847,11 @@ function animateSignSpin(targetSector, spinSign, rotations) {
 function onSignSettled(sector) {
   const label = COMPASS_LABELS[sector];
   adventureState.direction = { sector, label, bearingDeg: sector * 45 };
-  el("sign-board").setAttribute("aria-label", `方向標識、決定した方角は${label}`);
   el("direction-result-text").textContent = `今日は${label}へ。`;
   el("direction-result-sub").textContent = "最初の200〜300mだけ、この方向を意識してみよう。";
   el("direction-result").classList.remove("hidden");
+  // #sign-boardはaria-hiddenな視覚要素なので、読み上げ用にsr-onlyのライブリージョンへ結果を通知する。
+  el("sign-sr-status").textContent = `方角が決まりました。今日は${label}へ。`;
   const confirmBtn = el("btn-confirm-direction");
   if (confirmBtn) confirmBtn.focus();
 }
@@ -843,11 +862,13 @@ function showDirectionPanel() {
   el("direction-hint").textContent = isNightTime()
     ? "明るく、人通りのある道を選んでください。標識をはじいて方角を決めよう。"
     : "標識をはじいて、今日進む方角を決めよう。";
+  el("sign-sr-status").textContent = "まだ方角は決まっていません。標識を回すボタンで方角を決められます。";
 }
 
 function redoDirection() {
   el("direction-result").classList.add("hidden");
   adventureState.direction = null;
+  el("sign-sr-status").textContent = "方角をやり直します。もう一度、標識を回すボタンを押してください。";
   const spinBtn = el("btn-spin-sign");
   if (spinBtn) spinBtn.focus();
 }
@@ -856,6 +877,7 @@ function confirmDirection() {
   if (!adventureState.direction) return;
   adventureState.startedAt = Date.now();
   adventureState.startLatLon = lastKnownLatLon ? { ...lastKnownLatLon } : null;
+  adventureState.sessionDiscoveredCellIds = [];
   compassState = "collapsed";
   renderCompass();
   setAdventureStatus("active");
@@ -878,6 +900,12 @@ function handleCellDiscoveryFeedback(ix, iy) {
 
   if (adventureState.status === "active") {
     adventureState.discoveredCells++;
+    const alreadyTracked = adventureState.sessionDiscoveredCellIds.some(
+      (c) => c.ix === ix && c.iy === iy
+    );
+    if (!alreadyTracked) {
+      adventureState.sessionDiscoveredCellIds.push({ ix, iy });
+    }
     renderAdventureHud();
     if (!adventureState.targetReached && adventureState.discoveredCells >= adventureState.targetCells) {
       adventureState.targetReached = true;
@@ -932,14 +960,16 @@ function spawnConfetti() {
 }
 
 /* ---------- 冒険完了シート ---------- */
+let lastCompletionMessage = ""; // 成果カードでも同じ一行メッセージを使い回すため保持
+
 function showCompletionSheet() {
   const preset = adventureState.preset ? ADVENTURE_PRESETS[adventureState.preset] : null;
   el("completion-duration").textContent = preset ? `${preset.minutes}分` : "--";
   el("completion-direction").textContent = adventureState.direction ? adventureState.direction.label : "--";
   el("completion-session-cells").textContent = `${adventureState.discoveredCells}`;
   el("completion-total-cells").textContent = `${Object.keys(visited).length}`;
-  const msg = COMPLETION_MESSAGES[Math.floor(Math.random() * COMPLETION_MESSAGES.length)];
-  el("completion-message").textContent = msg;
+  lastCompletionMessage = COMPLETION_MESSAGES[Math.floor(Math.random() * COMPLETION_MESSAGES.length)];
+  el("completion-message").textContent = lastCompletionMessage;
   const firstBtn = el("completion-sheet").querySelector("button");
   if (firstBtn) firstBtn.focus();
 }
@@ -974,6 +1004,175 @@ function finishToday() {
   setAdventureStatus("idle");
 }
 
+/* ==========================================================
+   共有カード（プライバシーを守ったスクリーンショット用表示）
+   現在地・緯度経度・地図・道路名・開始/終了地点など、生活圏を推測できる
+   情報は一切表示しない。地図タイルも読み込まない完全に独立したオーバーレイ。
+   ========================================================== */
+const SHARE_CARD_BG_IDS = ["hud", "frontier-compass", "adventure-hud", "map"];
+// 共有カードは他のパネルの上に不透明で重なるため、判定順は必ずカードを先にする
+// （背景の親パネルはカード表示中も非表示化していないため、配列順が優先度になる）。
+const FOCUS_TRAP_CONTAINER_IDS = [
+  "direction-card",
+  "achievement-card",
+  "night-warning-panel",
+  "duration-panel",
+  "direction-panel",
+  "completion-sheet",
+];
+let shareCardReturnFocusEl = null;
+
+function getFocusableElements(container) {
+  const nodes = container.querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+  );
+  return Array.from(nodes).filter((n) => !n.disabled && n.offsetParent !== null);
+}
+
+function getOpenModalContainer() {
+  for (const id of FOCUS_TRAP_CONTAINER_IDS) {
+    const elm = el(id);
+    if (elm && !elm.classList.contains("hidden")) return elm;
+  }
+  return null;
+}
+
+// 主要モーダル・共有カード共通の簡易フォーカストラップ + 共有カードのみEscapeで閉じる
+function handleGlobalModalKeydown(e) {
+  const container = getOpenModalContainer();
+  if (!container) return;
+
+  if (e.key === "Tab") {
+    const focusables = getFocusableElements(container);
+    if (focusables.length === 0) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  } else if (e.key === "Escape" && (container.id === "direction-card" || container.id === "achievement-card")) {
+    e.preventDefault();
+    closeShareCard(container.id);
+  }
+}
+
+function openShareCard(cardId) {
+  shareCardReturnFocusEl = document.activeElement;
+  SHARE_CARD_BG_IDS.forEach((id) => {
+    const bgEl = document.getElementById(id);
+    if (bgEl) bgEl.setAttribute("aria-hidden", "true");
+  });
+  const card = el(cardId);
+  card.classList.remove("hidden");
+  const focusables = getFocusableElements(card);
+  if (focusables.length > 0) focusables[0].focus();
+}
+
+function closeShareCard(cardId) {
+  const card = el(cardId);
+  card.classList.add("hidden");
+  SHARE_CARD_BG_IDS.forEach((id) => {
+    const bgEl = document.getElementById(id);
+    if (bgEl) bgEl.removeAttribute("aria-hidden");
+  });
+  if (shareCardReturnFocusEl && typeof shareCardReturnFocusEl.focus === "function") {
+    try {
+      shareCardReturnFocusEl.focus();
+    } catch (e) {
+      // フォーカス対象が既にDOMから外れている場合は無視する
+    }
+  }
+  shareCardReturnFocusEl = null;
+}
+
+/* ---------- Priority 1: 方向決定カード ---------- */
+function showDirectionCard() {
+  if (!adventureState.direction) return;
+  el("share-sign-board").style.transform = `rotate(${adventureState.direction.bearingDeg}deg)`;
+  el("direction-card-text").textContent = `今日は${adventureState.direction.label}へ。`;
+  openShareCard("direction-card");
+}
+
+/* ---------- Priority 3: 今回歩いた形の匿名化 ----------
+   実際の緯度経度・セルの絶対座標は一切表示しない。
+   1) 最小X・最小Yを引いて原点へ移動
+   2) 0/90/180/270度のいずれかをランダムに適用
+   3) 再度、原点へ寄せて中央に収まる形だけを残す */
+function rotatePointCW90(p) {
+  return { x: -p.y, y: p.x };
+}
+
+function computeSessionShapeCells(cellIds) {
+  if (!cellIds || cellIds.length === 0) return [];
+  const minIx = Math.min(...cellIds.map((c) => c.ix));
+  const minIy = Math.min(...cellIds.map((c) => c.iy));
+  let points = cellIds.map((c) => ({ x: c.ix - minIx, y: c.iy - minIy }));
+
+  const rotations = Math.floor(Math.random() * 4); // 0,1,2,3 → 0/90/180/270度
+  for (let i = 0; i < rotations; i++) {
+    points = points.map(rotatePointCW90);
+  }
+
+  const minX = Math.min(...points.map((p) => p.x));
+  const minY = Math.min(...points.map((p) => p.y));
+  return points.map((p) => ({ x: p.x - minX, y: p.y - minY }));
+}
+
+function renderShapeGrid(container, cellIds) {
+  container.innerHTML = "";
+  const cells = computeSessionShapeCells(cellIds);
+  if (cells.length === 0) return;
+
+  const width = Math.max(...cells.map((c) => c.x)) + 1;
+  const height = Math.max(...cells.map((c) => c.y)) + 1;
+  const cellPx = Math.max(
+    SHAPE_GRID_MIN_CELL_PX,
+    Math.min(SHAPE_GRID_MAX_CELL_PX, Math.floor(SHAPE_GRID_MAX_PX / Math.max(width, height)))
+  );
+  container.style.gridTemplateColumns = `repeat(${width}, ${cellPx}px)`;
+  container.style.gridTemplateRows = `repeat(${height}, ${cellPx}px)`;
+
+  cells.forEach((c) => {
+    const sq = document.createElement("div");
+    sq.className = "shape-cell";
+    sq.style.gridColumn = `${c.x + 1}`;
+    sq.style.gridRow = `${c.y + 1}`;
+    container.appendChild(sq);
+  });
+}
+
+/* ---------- Priority 2 + 4: 冒険成果カード ---------- */
+function showAchievementCard() {
+  el("achievement-cell-count").textContent = `${adventureState.sessionDiscoveredCellIds.length}`;
+  const preset = adventureState.preset ? ADVENTURE_PRESETS[adventureState.preset] : null;
+  el("achievement-duration").textContent = preset ? `${preset.minutes}分` : "--";
+  el("achievement-direction").textContent = adventureState.direction ? adventureState.direction.label : "--";
+  el("achievement-message").textContent = lastCompletionMessage;
+
+  const notice = el("share-privacy-notice");
+  const alreadyAcked = store.get(STORAGE_KEYS.privacyAck, false);
+  notice.classList.toggle("hidden", !!alreadyAcked);
+  if (!alreadyAcked) {
+    try {
+      store.set(STORAGE_KEYS.privacyAck, true);
+    } catch (e) {
+      // 保存に失敗しても表示自体は継続する
+    }
+  }
+
+  try {
+    renderShapeGrid(el("achievement-shape-grid"), adventureState.sessionDiscoveredCellIds);
+  } catch (e) {
+    // シルエット描画に失敗してもカード自体は表示する
+  }
+
+  openShareCard("achievement-card");
+}
+
 /* ---------- 位置情報の処理 ---------- */
 let lastAccuracyWarnAt = 0;
 
@@ -986,14 +1185,21 @@ function handlePosition(pos) {
   }
 
   if (!map) {
-    initMap(lat, lon);
+    try {
+      initMap(lat, lon);
+    } catch (e) {
+      // 地図初期化の一部が失敗しても、以降の処理（冒険フロー開始など）は止めない。
+      console.error("initMap failed", e);
+      showToast("地図の初期化で問題が発生しました");
+    }
     try {
       // 初回の位置取得・地図準備が完了した直後に、冒険時間選択へ自動で進む。
       beginAdventureFlow();
     } catch (e) {
-      console.error(e);
+      console.error("beginAdventureFlow failed", e);
+      showToast("冒険の準備で問題が発生しました。再読み込みしてください。");
     }
-  } else {
+  } else if (meMarker) {
     meMarker.setLatLng([lat, lon]);
   }
   hideLoading();
@@ -1159,6 +1365,16 @@ window.addEventListener("DOMContentLoaded", () => {
   el("btn-open-way-home").addEventListener("click", openWayHome);
   el("btn-continue-adventure").addEventListener("click", continueAdventure);
   el("btn-finish-today").addEventListener("click", finishToday);
+
+  // ---- 共有カード ----
+  el("btn-show-direction-card").addEventListener("click", showDirectionCard);
+  el("btn-close-direction-card").addEventListener("click", () => closeShareCard("direction-card"));
+  el("btn-show-achievement-card").addEventListener("click", showAchievementCard);
+  el("btn-close-achievement-card").addEventListener("click", () => closeShareCard("achievement-card"));
+  el("btn-privacy-ack").addEventListener("click", () => {
+    el("share-privacy-notice").classList.add("hidden");
+  });
+  document.addEventListener("keydown", handleGlobalModalKeydown);
 
   // 既に許可済みなら初期画面を出さずに即開始（Permissions APIが使える場合のみ）
   if (navigator.permissions && navigator.permissions.query) {

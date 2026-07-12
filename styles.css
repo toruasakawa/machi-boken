@@ -351,6 +351,18 @@ body{
 }
 .btn-primary{ border: none; background: var(--amber); color: #111827; font-weight: 700; }
 .btn-secondary{ border: 1px solid var(--panel-border); background: transparent; color: var(--text); }
+.share-trigger-btn{
+  display: block;
+  width: 100%;
+  margin-top: 10px;
+  padding: 11px;
+  border-radius: 10px;
+  border: 1px solid var(--amber-dim);
+  background: rgba(245,158,11,0.08);
+  color: var(--amber);
+  font-size: 13px;
+  font-weight: 700;
+}
 
 /* 冒険完了シート */
 .completion-stats{ list-style: none; padding: 0; margin: 4px 0 14px; }
@@ -370,6 +382,98 @@ body{
   border: 1px solid var(--panel-border); background: transparent; color: var(--text);
 }
 #btn-finish-today{ border: none; background: var(--amber); color: #111827; font-weight: 700; }
+
+/* スクリーンリーダー専用（視覚的には非表示だが読み上げ対象として残す） */
+.sr-only{
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0,0,0,0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* 共有カード（プライバシーを守ったスクリーンショット用の全画面オーバーレイ）
+   現在地・地図・道路名は一切含まないため、常に不透明な単色背景のみで構成する。 */
+.share-card{
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(160deg, #0b1020 0%, #151f34 100%);
+  padding: 32px 20px;
+}
+.share-card.hidden{ display: none; }
+.share-card-close{
+  position: absolute;
+  top: max(14px, env(safe-area-inset-top));
+  right: 14px;
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--panel-border);
+  background: rgba(255,255,255,0.06);
+  color: var(--text-dim);
+  font-size: 16px;
+  line-height: 1;
+}
+.share-card-inner{
+  width: 100%; max-width: 340px;
+  aspect-ratio: 9 / 16;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px;
+  text-align: center;
+  border: 1px solid var(--panel-border);
+  border-radius: 24px;
+  padding: 28px 22px;
+  background: rgba(17,24,39,0.55);
+  overflow: hidden;
+}
+.share-card-headline{ font-size: 21px; font-weight: 700; color: var(--text); margin: 4px 0 0; }
+.share-card-tagline{ font-size: 13px; color: var(--amber); font-weight: 700; margin: 6px 0 0; }
+.share-card-appname{ font-size: 12px; color: var(--text-dim); letter-spacing: 0.08em; margin: 0; }
+.share-card-title{ font-size: 14px; color: var(--text-dim); margin: 0; letter-spacing: 0.04em; }
+
+.share-sign-stage{ position: relative; width: 132px; height: 158px; margin: 0 auto; }
+.share-sign-post{
+  position: absolute; left: 50%; bottom: 0; width: 8px; height: 90px; margin-left: -4px;
+  background: linear-gradient(180deg, #4b5563, #374151); border-radius: 4px;
+}
+.share-sign-board{
+  position: absolute; left: 50%; top: 0; width: 100px; height: 100px; margin-left: -50px;
+  border-radius: 20px;
+  background: linear-gradient(160deg, var(--amber), #d97706);
+  border: 3px solid #fde68a;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.4);
+}
+.share-sign-arrow{ font-size: 38px; color: #111827; line-height: 1; }
+
+.achievement-stats{ display: flex; gap: 16px; justify-content: center; margin: 2px 0; }
+.achievement-stat{ display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.achievement-stat-value{ font-size: 21px; font-weight: 700; color: var(--amber); }
+.achievement-stat-label{ font-size: 10px; color: var(--text-dim); }
+
+.share-privacy-notice{
+  font-size: 11px; color: var(--text-dim);
+  border: 1px solid var(--panel-border); border-radius: 10px;
+  padding: 8px 10px;
+  display: flex; align-items: center; gap: 10px;
+  max-width: 100%;
+}
+.share-privacy-notice.hidden{ display: none; }
+.share-privacy-notice p{ margin: 0; flex: 1; text-align: left; line-height: 1.5; }
+#btn-privacy-ack{
+  flex-shrink: 0; padding: 4px 10px; border-radius: 8px;
+  border: 1px solid var(--panel-border); background: transparent; color: var(--text); font-size: 11px;
+}
+
+.achievement-shape-caption{ font-size: 11px; color: var(--text-dim); margin: 4px 0 0; }
+.achievement-shape-grid{
+  display: inline-grid;
+  gap: 3px;
+  justify-content: center;
+  align-content: center;
+}
+.shape-cell{ background: var(--amber); border-radius: 4px; }
 
 /* 発見トーストの節目バリアント */
 #toast.toast-milestone{

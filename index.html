@@ -107,6 +107,7 @@
         <span class="sign-arrow">↑</span>
       </div>
     </div>
+    <p id="sign-sr-status" class="sr-only" aria-live="polite">まだ方角は決まっていません。</p>
     <button id="btn-spin-sign" class="sign-spin-btn" type="button">標識を回す</button>
     <div id="direction-result" class="direction-result hidden">
       <p id="direction-result-text" class="direction-result-text"></p>
@@ -115,6 +116,7 @@
         <button id="btn-redo-direction" class="btn-secondary" type="button">もう一度決める</button>
         <button id="btn-confirm-direction" class="btn-primary" type="button">この方向で冒険開始</button>
       </div>
+      <button id="btn-show-direction-card" class="share-trigger-btn" type="button">カード表示</button>
     </div>
   </div>
 </div>
@@ -130,10 +132,61 @@
     <li><span class="completion-label">累計発見した場所</span><span id="completion-total-cells"></span></li>
   </ul>
   <p id="completion-message" class="completion-message"></p>
+  <button id="btn-show-achievement-card" class="share-trigger-btn" type="button">成果カードを見る</button>
   <div class="completion-actions">
     <button id="btn-open-way-home" type="button">帰り道を開く</button>
     <button id="btn-continue-adventure" type="button">帰りも冒険する</button>
     <button id="btn-finish-today" type="button">今日は終わる</button>
+  </div>
+</div>
+
+<!-- 方向決定カード（スクリーンショット用・位置情報は一切表示しない） -->
+<div id="direction-card" class="share-card hidden" role="dialog" aria-modal="true" aria-labelledby="direction-card-app-name">
+  <button id="btn-close-direction-card" class="share-card-close" type="button" aria-label="カードを閉じる">×</button>
+  <div class="share-card-inner">
+    <div class="share-sign-stage">
+      <div class="share-sign-post"></div>
+      <div id="share-sign-board" class="share-sign-board" aria-hidden="true">
+        <span class="share-sign-arrow">↑</span>
+      </div>
+    </div>
+    <p id="direction-card-text" class="share-card-headline"></p>
+    <p class="share-card-tagline">知らない道を、正解にする。</p>
+    <p id="direction-card-app-name" class="share-card-appname">マチ冒険</p>
+  </div>
+</div>
+
+<!-- 冒険成果カード（スクリーンショット用・位置情報は一切表示しない） -->
+<div id="achievement-card" class="share-card hidden" role="dialog" aria-modal="true" aria-labelledby="achievement-card-title">
+  <button id="btn-close-achievement-card" class="share-card-close" type="button" aria-label="カードを閉じる">×</button>
+  <div class="share-card-inner">
+    <p id="achievement-card-title" class="share-card-title">今日のマチ冒険</p>
+    <div class="achievement-stats">
+      <div class="achievement-stat">
+        <span class="achievement-stat-value" id="achievement-cell-count"></span>
+        <span class="achievement-stat-label">新しい場所</span>
+      </div>
+      <div class="achievement-stat">
+        <span class="achievement-stat-value" id="achievement-duration"></span>
+        <span class="achievement-stat-label">冒険時間</span>
+      </div>
+      <div class="achievement-stat">
+        <span class="achievement-stat-value" id="achievement-direction"></span>
+        <span class="achievement-stat-label">方向</span>
+      </div>
+    </div>
+
+    <div id="share-privacy-notice" class="share-privacy-notice hidden">
+      <p>このカードには現在地や道路名は表示されません。</p>
+      <button id="btn-privacy-ack" type="button">OK</button>
+    </div>
+
+    <p class="achievement-shape-caption">今日歩いた形</p>
+    <div id="achievement-shape-grid" class="achievement-shape-grid" aria-hidden="true"></div>
+
+    <p id="achievement-message" class="share-card-headline"></p>
+    <p class="share-card-tagline">知らない道を、正解にする。</p>
+    <p class="share-card-appname">マチ冒険</p>
   </div>
 </div>
 

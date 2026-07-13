@@ -52,13 +52,56 @@ const COMPLETION_MESSAGES = [
 const NIGHT_START_HOUR = 18;
 const NIGHT_END_HOUR = 6; // この時刻未満は夜間
 
-// 道路標識（方向決定UI）: はじく強さ→回転量の変換や最低保証回転数
-const SIGN_MIN_ROTATIONS = 2;
-const SIGN_MAX_ROTATIONS = 6;
-const SIGN_VELOCITY_TO_ROTATIONS = 900; // deg/s あたりの回転数換算スケール
-const SIGN_OVERSHOOT_DEG = 14; // 停止直前の小さなオーバーシュート量
 // 方角の重み付け: index=フロンティア方位からの円環距離(0=最優先,4=反対)
 const DIRECTION_WEIGHT_BY_DISTANCE = [10, 5, 2, 1, 1];
+
+// 道路標識（方向決定UI）の物理定数。実機調整はこのオブジェクトだけで完結するようにする。
+// 単位は角度=度(deg)、角速度=度/ミリ秒(deg/ms)で統一している。
+const SIGN_PHYSICS = {
+  historyWindowMs: 150,        // pointerup直前、角速度算出に使う履歴の時間窓
+  minVelocitySampleDt: 8,      // 角速度算出に使う最古〜最新サンプルの最小間隔(ms未満は採用しない)
+  tapMaxAngleDeg: 6,           // これ未満の正味移動量ならタップ候補
+  tapMaxDurationMs: 250,       // これ未満の操作時間ならタップ候補
+  minFlickVelocity: 0.06,      // これ未満の角速度(deg/ms)は事実上タップ扱い（フリックの下限でもある）
+  maxInputVelocity: 1.6,       // 入力角速度(deg/ms)の実測上限の目安。これ以上はclampする
+  minSpinVelocity: 3.9,        // 慣性回転の初速下限(deg/ms)（タップ以外の最弱フリック）
+  maxSpinVelocity: 5.7,        // 慣性回転の初速上限(deg/ms)（最強フリック）
+  velocityCurvePower: 0.7,     // 入力強度→初速・摩擦のカーブ指数(1未満で弱入力側の差を強調)
+  // 摩擦は初速に応じて可変にする（強い入力ほど摩擦を弱めて長く/多く回るようにし、
+  // 回転数と停止時間の両方が入力強度に連動して伸びるようにする）。
+  frictionPerFrameAt60fpsMin: 0.878, // 最弱フリック時の摩擦係数（小さいほど速く減速）
+  frictionPerFrameAt60fpsMax: 0.949, // 最強フリック時の摩擦係数（大きいほどゆっくり減速＝長く回る）
+  snapVelocityThreshold: 0.02, // 角速度がこれ未満まで減衰したら吸着フェーズへ移行(deg/ms)
+  overshootDeg: 4,             // 吸着直前の小さなオーバーシュート量(度)
+  overshootDurationMs: 200,    // オーバーシュート角度までの所要時間
+  settleBackDurationMs: 150,   // オーバーシュートから最終角度へ戻る所要時間
+  maxSpinDurationMs: 2500,     // 慣性回転フェーズの最大許容時間（安全装置。これを超えたら強制的に吸着へ）
+  tapSpinRotationRangeDeg: [90, 270], // タップ時の回転量の目安レンジ(度。0.25〜0.75回転相当)
+  tapSpinDurationRangeMs: [500, 900], // タップ時の停止フェーズ所要時間の目安レンジ
+  buttonSpinVelocity: 0.55,    // 「標識を回す」ボタン押下時に使う疑似入力速度(deg/ms、中程度のフリック相当)
+};
+
+const DEBUG_SIGN_PHYSICS = false; // trueにすると操作の計測値・分類・初速などをコンソールへ出力する
+
+// pointerup直前のリリース角速度をどう算出するかの設定。
+// 「最後だけ強くはじく」操作を、履歴全体の平均で薄めずに正しく拾うことが目的。
+const SIGN_RELEASE_VELOCITY = {
+  preferredWindowMs: 80,    // まずこの時間内(直近)のサンプルだけで速度を計算する
+  fallbackWindowMs: 150,    // 直近サンプルが不十分なら、ここまで範囲を広げる
+  minimumWindowMs: 24,      // これ未満の時間差では信頼できる速度が出せない
+  minimumSampleCount: 3,    // 採用ウィンドウ内に必要な最小サンプル数
+  recencyWeightPower: 2,    // 直近ほど重みを強める指数（大きいほど最新区間を強調）
+  recencyWeightMax: 3,      // 直近区間に上乗せされる重みの最大値（基本重み1 + これ）
+  maxSegmentVelocity: 50,   // 1区間の角速度がこれを超えたら明らかな外れ値として除外する(deg/ms)
+  usePeakBlend: true,       // 加重平均だけでなく、直近ピーク速度も少量ブレンドするか
+};
+// 加重平均とピーク速度のブレンド比率（usePeakBlend時のみ使用）。
+const RELEASE_VELOCITY_BLEND = {
+  weightedAverageRatio: 0.75,
+  recentPeakRatio: 0.25,
+};
+
+const DEBUG_SIGN_RELEASE_VELOCITY = false; // trueで1操作ごとにリリース速度の詳細計測値をコンソールへ出力する
 
 const STORAGE_KEYS = {
   origin: "am_origin",
@@ -649,32 +692,98 @@ function selectAdventurePreset(presetKey) {
 }
 
 /* ---------- 道路標識・方向決定UI ----------
-   フロンティア・コンパスの方位判定ロジック(computeFrontierDirection)を
-   そのまま流用し、優先方向を中心に揺らぎを持たせた重み付き抽選で方角を選ぶ。 */
+   フロンティア・コンパスの方位判定ロジック(computeFrontierDirection)を再利用しつつ、
+   回転そのものは pointerup 直前の実測角速度を初速とした摩擦(慣性)物理で駆動する。
+   タップ/フリックの強弱が回転速度・回転数・停止時間へ連続的に反映されることが目的。 */
 let signSpinning = false;
-let signDragState = null;
+let signDragState = null;   // {center, lastAngle, cumulativeDelta, startRotation, downTime, browserEventCount, coalescedSampleCount, history:[{angle,timestamp}]}
 let currentSignRotation = 0;
 let signAnimationFrameId = null;
+let activeSignPointerId = null; // 複数ポインター同時操作を防ぐため、操作中のpointerIdを1つだけ保持する
+let pendingReleaseDebug = null; // DEBUG_SIGN_RELEASE_VELOCITY用に、release計算〜spin完了までの計測値を橋渡しする一時オブジェクト
 
-function pickWeightedDirectionSector(frontierResult) {
+// 低速反時計回り操作の方向反転バグ対策: releaseVelocityが小さすぎて信頼できない場合でも、
+// 直前に観測された実際のドラッグ方向を優先して回転方向を決めるための状態。
+let lastSignDragDirection = 0; // pointerdownで0にリセットし、有効な角度移動があるたびに±1で更新する
+const MIN_DIRECTION_DELTA_DEG = 0.2; // これ未満の1サンプルあたりの角度差はノイズとみなし方向を更新しない
+const MIN_DIRECTIONAL_VELOCITY = SIGN_PHYSICS.minFlickVelocity; // これ以上の角速度なら、その符号をそのまま信頼する
+const DEFAULT_TAP_SPIN_DIRECTION = 1; // 方向情報が一切無い完全なタップの既定回転方向（時計回り）
+
+// 回転方向の決定優先順位: 1) 十分な大きさのある実測リリース速度の符号
+// 2) 低速でも直前に観測された実際のドラッグ方向 3) 完全なタップの既定方向。
+// releaseVelocityがNaN/Infinity・小さすぎる場合でも、ユーザーの入力方向を勝手に反転させないためのもの。
+function resolveSpinDirection(releaseVelocity) {
+  if (Number.isFinite(releaseVelocity) && Math.abs(releaseVelocity) >= MIN_DIRECTIONAL_VELOCITY) {
+    return Math.sign(releaseVelocity);
+  }
+  if (lastSignDragDirection !== 0) {
+    return lastSignDragDirection;
+  }
+  return DEFAULT_TAP_SPIN_DIRECTION;
+}
+let spinStartRotationForDebug = 0; // DEBUG_SIGN_RELEASE_VELOCITY用に、回転量の実測に使う開始角度
+
+function logSignReleaseVelocityDebug() {
+  if (!DEBUG_SIGN_RELEASE_VELOCITY || !pendingReleaseDebug) return;
+  console.log("[sign-release-velocity]", pendingReleaseDebug);
+  pendingReleaseDebug = null;
+}
+
+function logSignDebug(label, data) {
+  if (!DEBUG_SIGN_PHYSICS) return;
+  console.log(`[sign-physics] ${label}`, data);
+}
+
+function clamp01(v) {
+  return Math.max(0, Math.min(1, v));
+}
+
+function randRange(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+// candidateSectors の中から、frontierResult の優先方向に近いほど選ばれやすい重み付き抽選を行う。
+// タップ時は8方位すべてを、フリック時は自然停止角度周辺の3方位のみを候補として渡す想定。
+function pickWeightedSector(candidateSectors, frontierResult) {
   const hasFrontier = frontierResult && frontierResult.hasFrontier;
-  const weights = [];
-  for (let s = 0; s < 8; s++) {
-    if (!hasFrontier) {
-      weights.push(1); // 未踏エリアの偏りが無ければ均等ランダム
-      continue;
-    }
+  const weights = candidateSectors.map((s) => {
+    if (!hasFrontier) return 1; // 未踏方向の偏りが無ければ均等ランダム
     const raw = Math.abs(s - frontierResult.sector);
     const dist = Math.min(raw, 8 - raw);
-    weights.push(DIRECTION_WEIGHT_BY_DISTANCE[dist]);
-  }
+    return DIRECTION_WEIGHT_BY_DISTANCE[dist];
+  });
   const total = weights.reduce((a, b) => a + b, 0);
   let r = Math.random() * total;
-  for (let s = 0; s < 8; s++) {
-    r -= weights[s];
-    if (r <= 0) return s;
+  for (let i = 0; i < candidateSectors.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return candidateSectors[i];
   }
-  return 0;
+  return candidateSectors[0];
+}
+
+// 自然停止方角(現在の回転角に最も近い8方位)を中心に、左右隣の方角を候補化して
+// 未踏方向へ重み付けした抽選を行う。ただし、現在の回転方向(dirSign)を維持したまま
+// 到達しようとすると"ほぼ1周分の遠回り"になってしまう側の隣接候補は、不自然に大きな
+// 回転を招くため候補から除外する（未踏方向ロジックによる急な逆回転も同時に防ぐ）。
+const MAX_NATURAL_SNAP_DELTA_DEG = 225;
+
+function pickFlickLandingSector(currentRotation, dirSign, frontierResult) {
+  const mod = ((currentRotation % 360) + 360) % 360;
+  const natural = Math.round(mod / 45) % 8;
+  const rawCandidates = [natural, (natural + 7) % 8, (natural + 1) % 8];
+  const reachable = rawCandidates.filter((s) => {
+    const delta = computeFinalRotation(currentRotation, s * 45, dirSign, 0) - currentRotation;
+    return Math.abs(delta) <= MAX_NATURAL_SNAP_DELTA_DEG;
+  });
+  const candidates = reachable.length > 0 ? reachable : [natural];
+  return { natural, candidates, targetSector: pickWeightedSector(candidates, frontierResult) };
+}
+
+function getFrontierForSign() {
+  const refLatLon = lastKnownLatLon || (origin ? { lat: origin.lat0, lon: origin.lon0 } : null);
+  if (!refLatLon) return { hasFrontier: false };
+  if (compassResult && compassResult.hasFrontier) return compassResult;
+  return computeFrontierDirection(refLatLon.lat, refLatLon.lon);
 }
 
 function getSignBoardCenter() {
@@ -686,6 +795,7 @@ function angleFromCenter(clientX, clientY, center) {
   return (Math.atan2(clientY - center.y, clientX - center.x) * 180) / Math.PI;
 }
 
+// 0度と360度をまたぐ角度差を -180〜180度の範囲へ正規化する。
 function normalizeAngleDelta(delta) {
   let d = delta % 360;
   if (d > 180) d -= 360;
@@ -705,16 +815,82 @@ function cancelSignAnimation() {
   signSpinning = false;
 }
 
-function computeFinalRotation(current, targetBearingDeg, spinSign, rotations) {
+// current(現在の回転角、度・無制限) から、spinSignの向きを保ったまま targetBearingDeg(0-359)へ
+// extraRotations回分の360度を追加してから到達する最終回転角を返す。
+function computeFinalRotation(current, targetBearingDeg, spinSign, extraRotations) {
   const currentMod = ((current % 360) + 360) % 360;
   const deltaCW = (targetBearingDeg - currentMod + 360) % 360;
   const delta = spinSign >= 0 ? deltaCW : deltaCW === 0 ? 0 : deltaCW - 360;
-  return current + spinSign * rotations * 360 + delta;
+  return current + spinSign * extraRotations * 360 + delta;
+}
+
+function trimPointerHistory(history, now) {
+  // 直近 historyWindowMs 分だけを残す。ただし速度算出には最低2点必要なので2点は必ず残す。
+  while (history.length > 2 && now - history[0].timestamp > SIGN_PHYSICS.historyWindowMs) {
+    history.shift();
+  }
+}
+
+// ブラウザが複数の細かなポインター移動を1つのpointermove/pointerupへ統合している場合に備え、
+// getCoalescedEvents()が使えるならその生サンプル列を、使えない・空なら元イベント1件を返す。
+function getPointerSamples(event) {
+  if (typeof event.getCoalescedEvents === "function") {
+    try {
+      const coalesced = event.getCoalescedEvents();
+      if (coalesced && coalesced.length > 0) return coalesced;
+    } catch (err) {
+      // 未対応・失敗時は元イベントへフォールバックする
+    }
+  }
+  return [event];
+}
+
+// pointerdown/pointermove/pointerup(とそのcoalesced event)共通のサンプル記録処理。
+// 角度差の正規化・累積回転・履歴追加をまとめて行う。異常サンプルや完全な重複は無視する。
+function recordSignPointerSample(sample) {
+  if (!signDragState) return;
+  if (sample.pointerId != null && sample.pointerId !== activeSignPointerId) return; // 他ポインターのサンプルは無視
+  const angle = angleFromCenter(sample.clientX, sample.clientY, signDragState.center);
+  if (!Number.isFinite(angle)) return; // 座標異常なサンプルは除外
+
+  const history = signDragState.history;
+  const last = history[history.length - 1];
+  const rawTimestamp =
+    typeof sample.timeStamp === "number" && Number.isFinite(sample.timeStamp) ? sample.timeStamp : performance.now();
+
+  // 直前と完全に同じ時刻・同じ角度の重複サンプルは追加しない
+  if (last && rawTimestamp === last.timestamp && angle === signDragState.lastAngle) return;
+
+  const delta = normalizeAngleDelta(angle - signDragState.lastAngle);
+  signDragState.lastAngle = angle;
+  signDragState.cumulativeDelta += delta;
+  currentSignRotation = signDragState.startRotation + signDragState.cumulativeDelta;
+
+  // ノイズ以上の角度移動があれば、そのときの向きを「直前に観測された実際のドラッグ方向」として保持する。
+  // releaseVelocityが低速・不正で信頼できない場合の方向決定フォールバックに使う。
+  //
+  // 1サンプルごとの差分ではなく、最後に方向を確定したチェックポイント(directionRefDelta)からの
+  // 累積差分で判定する。getCoalescedEvents()は1回の指の動きを非常に細かい(1サンプルあたり
+  // 0.1度未満の)複数サンプルへ分割することがあり、1サンプルごとの差分だけを見ていると
+  // 「実際は明確に方向のある動きなのに、どのサンプル単体も閾値未満」となって方向を
+  // 見失ってしまうため（低速・微小な反時計回り操作が既定方向へフォールバックしてしまうバグの原因）。
+  const deltaSinceDirectionCheckpoint = signDragState.cumulativeDelta - signDragState.directionRefDelta;
+  if (Math.abs(deltaSinceDirectionCheckpoint) >= MIN_DIRECTION_DELTA_DEG) {
+    lastSignDragDirection = Math.sign(deltaSinceDirectionCheckpoint);
+    signDragState.directionRefDelta = signDragState.cumulativeDelta;
+  }
+
+  // timeStampが前サンプル以前(逆行・重複)の場合は、順序を保つため直前+微小値へ補正する
+  const timestamp = last && rawTimestamp <= last.timestamp ? last.timestamp + 0.01 : rawTimestamp;
+  history.push({ angle: currentSignRotation, timestamp });
 }
 
 function onSignPointerDown(e) {
-  if (signSpinning) return;
-  cancelSignAnimation();
+  if (activeSignPointerId !== null && activeSignPointerId !== e.pointerId) return; // 複数ポインター同時操作は無視
+  cancelSignAnimation(); // 回転中でもその場で掴み直せるようにする
+  pendingReleaseDebug = null; // 直前の回転が未完了のまま掴み直された場合、古い計測値を持ち越さない
+  lastSignDragDirection = 0; // 新しい操作の開始時にリセットする（今回の操作で観測した方向だけを使うため）
+  activeSignPointerId = e.pointerId;
   const board = el("sign-board");
   try {
     board.setPointerCapture(e.pointerId);
@@ -723,33 +899,126 @@ function onSignPointerDown(e) {
   }
   const center = getSignBoardCenter();
   const angle = angleFromCenter(e.clientX, e.clientY, center);
+  const now = performance.now();
   signDragState = {
     center,
     lastAngle: angle,
     cumulativeDelta: 0,
+    directionRefDelta: 0, // 最後にlastSignDragDirectionを確定した時点のcumulativeDelta（チェックポイント）
     startRotation: currentSignRotation,
-    history: [{ t: performance.now(), rotation: currentSignRotation }],
+    downTime: now,
+    browserEventCount: 0,
+    coalescedSampleCount: 0,
+    history: [{ angle: currentSignRotation, timestamp: now }],
   };
   board.classList.add("dragging");
 }
 
 function onSignPointerMove(e) {
-  if (!signDragState) return;
-  const angle = angleFromCenter(e.clientX, e.clientY, signDragState.center);
-  const delta = normalizeAngleDelta(angle - signDragState.lastAngle);
-  signDragState.lastAngle = angle;
-  signDragState.cumulativeDelta += delta;
-  currentSignRotation = signDragState.startRotation + signDragState.cumulativeDelta;
-  applySignRotation(currentSignRotation);
+  if (!signDragState || e.pointerId !== activeSignPointerId) return;
+  signDragState.browserEventCount++;
+  const samples = getPointerSamples(e);
+  signDragState.coalescedSampleCount += samples.length;
+  samples.forEach(recordSignPointerSample);
+  applySignRotation(currentSignRotation); // ドラッグ中は慣性・イージング無しで指へ直接追従させる
   const now = performance.now();
-  signDragState.history.push({ t: now, rotation: currentSignRotation });
-  while (signDragState.history.length > 2 && now - signDragState.history[0].t > 200) {
-    signDragState.history.shift();
+  trimPointerHistory(signDragState.history, now);
+}
+
+// 履歴のうち直近(historyWindowMs以内)の最古〜最新サンプルから角速度を算出する単純な2点法。
+// 新しい加重平均計算(calculateReleaseAngularVelocity)が使えない場合の安全なフォールバックとして使う。
+function computeReleaseVelocity(history) {
+  if (!history || history.length < 2) return 0;
+  const first = history[0];
+  const last = history[history.length - 1];
+  const dt = last.timestamp - first.timestamp;
+  if (dt < SIGN_PHYSICS.minVelocitySampleDt) return 0;
+  const v = (last.angle - first.angle) / dt;
+  return Number.isFinite(v) ? v : 0;
+}
+
+function hasEnoughVelocityData(samples) {
+  if (!samples || samples.length < SIGN_RELEASE_VELOCITY.minimumSampleCount) return false;
+  const span = samples[samples.length - 1].timestamp - samples[0].timestamp;
+  return span >= SIGN_RELEASE_VELOCITY.minimumWindowMs;
+}
+
+// 直近preferredWindowMs以内のサンプルを優先し、不足していればfallbackWindowMsまで範囲を広げる。
+// それでも不十分なら履歴全体を返し、呼び出し側の2点法フォールバックに委ねる。
+function selectVelocityWindow(history) {
+  if (!history || history.length < 2) return history || [];
+  const latestTime = history[history.length - 1].timestamp;
+  const preferred = history.filter((s) => latestTime - s.timestamp <= SIGN_RELEASE_VELOCITY.preferredWindowMs);
+  if (hasEnoughVelocityData(preferred)) return preferred;
+  const fallback = history.filter((s) => latestTime - s.timestamp <= SIGN_RELEASE_VELOCITY.fallbackWindowMs);
+  if (hasEnoughVelocityData(fallback)) return fallback;
+  return history;
+}
+
+// ウィンドウ内での時間的な位置(0=最古側,1=最新側)に応じて、直近の区間ほど重くなる重みを返す。
+function calculateRecencyWeight(segmentEndTime, windowStartTime, windowDuration) {
+  if (windowDuration <= 0) return 1;
+  const recency = clamp01((segmentEndTime - windowStartTime) / windowDuration);
+  return 1 + Math.pow(recency, SIGN_RELEASE_VELOCITY.recencyWeightPower) * SIGN_RELEASE_VELOCITY.recencyWeightMax;
+}
+
+// pointerup直前の角速度を、直近ウィンドウ内の区間ごとの加重平均(+任意でピーク速度とのブレンド)で算出する。
+// 「最初はゆっくり、最後だけ鋭くはじく」操作でも、最後の区間の速度が全体平均で薄まらないことを狙う。
+function calculateReleaseAngularVelocity(fullHistory) {
+  const debug = {};
+  const window = selectVelocityWindow(fullHistory);
+
+  if (!hasEnoughVelocityData(window)) {
+    const fallbackSource = window && window.length >= 2 ? window : fullHistory;
+    const fallbackVelocity = computeReleaseVelocity(fallbackSource);
+    debug.fallbackUsed = true;
+    debug.selectedSampleCount = fallbackSource ? fallbackSource.length : 0;
+    return { velocity: fallbackVelocity, debug };
   }
+
+  const windowStartTime = window[0].timestamp;
+  const windowDuration = window[window.length - 1].timestamp - windowStartTime;
+
+  let weightedSum = 0;
+  let totalWeight = 0;
+  let peak = 0;
+
+  for (let i = 1; i < window.length; i++) {
+    const prev = window[i - 1];
+    const cur = window[i];
+    const dt = cur.timestamp - prev.timestamp;
+    if (dt <= 0) continue; // 時間差ゼロ以下の区間は除外
+    const deltaAngle = normalizeAngleDelta(cur.angle - prev.angle);
+    const velocity = deltaAngle / dt;
+    if (!Number.isFinite(velocity) || Math.abs(velocity) > SIGN_RELEASE_VELOCITY.maxSegmentVelocity) continue; // 異常値除外
+    const weight = calculateRecencyWeight(cur.timestamp, windowStartTime, windowDuration);
+    weightedSum += velocity * weight;
+    totalWeight += weight;
+    if (Math.abs(velocity) > Math.abs(peak)) peak = velocity;
+  }
+
+  if (totalWeight === 0) {
+    const fallbackVelocity = computeReleaseVelocity(fullHistory);
+    debug.fallbackUsed = true;
+    return { velocity: fallbackVelocity, debug };
+  }
+
+  const weightedAverage = weightedSum / totalWeight;
+  const blended = SIGN_RELEASE_VELOCITY.usePeakBlend
+    ? weightedAverage * RELEASE_VELOCITY_BLEND.weightedAverageRatio + peak * RELEASE_VELOCITY_BLEND.recentPeakRatio
+    : weightedAverage;
+
+  debug.selectedWindowMs = windowDuration;
+  debug.selectedSampleCount = window.length;
+  debug.rawWeightedVelocity = weightedAverage;
+  debug.recentPeakVelocity = peak;
+  debug.blendedVelocity = blended;
+
+  return { velocity: blended, debug };
 }
 
 function onSignPointerUp(e) {
-  if (!signDragState) return;
+  if (!signDragState || e.pointerId !== activeSignPointerId) return;
   const board = el("sign-board");
   try {
     board.releasePointerCapture(e.pointerId);
@@ -757,91 +1026,319 @@ function onSignPointerUp(e) {
     // 無視して継続
   }
   board.classList.remove("dragging");
-  const history = signDragState.history;
-  const first = history[0];
-  const last = history[history.length - 1];
-  const dt = last.t - first.t;
-  const velocityDegPerMs = dt > 8 ? (last.rotation - first.rotation) / dt : 0;
+
+  // 最後のpointermoveからpointerupまでの動きが履歴から欠落しないよう、
+  // pointerup自身(とそのcoalesced event)も速度算出の前に履歴へ追加する。
+  // recordSignPointerSample()はactiveSignPointerIdとの一致でサンプルを検証するため、
+  // これをnullにするのはサンプル記録が終わった後でなければならない。
+  const upSamples = getPointerSamples(e);
+  signDragState.coalescedSampleCount += upSamples.length;
+  upSamples.forEach(recordSignPointerSample);
+  applySignRotation(currentSignRotation);
+  activeSignPointerId = null;
+
+  const now = performance.now();
+  const cumulativeDelta = signDragState.cumulativeDelta;
+  const movedAngle = Math.abs(cumulativeDelta);
+  const duration = now - signDragState.downTime;
+  const browserSampleCount = signDragState.browserEventCount;
+  const coalescedSampleCount = signDragState.coalescedSampleCount;
+
+  const releaseResult = calculateReleaseAngularVelocity(signDragState.history);
+  const velocityDegPerMs = releaseResult.velocity;
   signDragState = null;
-  triggerSignSpin({ velocityDegPerSec: velocityDegPerMs * 1000 });
+
+  // タップ判定: 動かした角度が小さいことを必須条件にする。
+  // 角度が小さい場合に限り、短時間で離したか、離す直前の角速度が極めて小さければタップ扱い。
+  // （movedAngleを見ずに velocity だけでタップ判定すると、"ゆっくり大きく動かして離す"
+  //   ような弱フリックまでタップの固定回転量に丸められてしまうため、角度条件をANDにしている。）
+  // 「タップ扱い」は回転の強さ・時間を控えめにするための分類であり、方向の決定は
+  // resolveSpinDirection()に一本化する（低速でも実際のドラッグ方向があればそれを尊重する）。
+  const isTap =
+    movedAngle < SIGN_PHYSICS.tapMaxAngleDeg &&
+    (duration < SIGN_PHYSICS.tapMaxDurationMs || Math.abs(velocityDegPerMs) < SIGN_PHYSICS.minFlickVelocity);
+  const resolvedSpinDirection = resolveSpinDirection(velocityDegPerMs);
+
+  logSignDebug("release", {
+    movedAngle,
+    duration,
+    velocityDegPerMs,
+    lastSignDragDirection,
+    resolvedSpinDirection,
+    classification: isTap ? "tap" : "flick",
+  });
+
+  if (DEBUG_SIGN_RELEASE_VELOCITY) {
+    pendingReleaseDebug = {
+      ...releaseResult.debug,
+      browserSampleCount,
+      coalescedSampleCount,
+      totalGestureDurationMs: duration,
+      totalDragAngle: movedAngle,
+      releaseVelocity: velocityDegPerMs,
+      lastSignDragDirection,
+      resolvedSpinDirection,
+    };
+  }
+
+  if (isTap) {
+    startTapSpin(velocityDegPerMs);
+    return;
+  }
+  startFlickSpin(Math.abs(velocityDegPerMs), resolvedSpinDirection);
 }
 
-function triggerSignSpin(opts) {
-  if (signSpinning) return;
-  const refLatLon = lastKnownLatLon || (origin ? { lat: origin.lat0, lon: origin.lon0 } : null);
-  const frontier = refLatLon
-    ? compassResult && compassResult.hasFrontier
-      ? compassResult
-      : computeFrontierDirection(refLatLon.lat, refLatLon.lon)
-    : { hasFrontier: false };
-  const targetSector = pickWeightedDirectionSector(frontier);
-
-  const v = opts && opts.velocityDegPerSec != null ? opts.velocityDegPerSec : 0;
-  const spinSign = v !== 0 ? Math.sign(v) : Math.random() < 0.5 ? -1 : 1;
-  const absV = Math.abs(v);
-  let rotations = Math.round(absV / SIGN_VELOCITY_TO_ROTATIONS);
-  rotations = Math.max(SIGN_MIN_ROTATIONS, Math.min(SIGN_MAX_ROTATIONS, rotations || SIGN_MIN_ROTATIONS));
-
-  animateSignSpin(targetSector, spinSign, rotations);
+function onSignPointerCancel(e) {
+  if (!signDragState || e.pointerId !== activeSignPointerId) return;
+  const board = el("sign-board");
+  try {
+    board.releasePointerCapture(e.pointerId);
+  } catch (err) {
+    // 無視して継続
+  }
+  board.classList.remove("dragging");
+  activeSignPointerId = null;
+  signDragState = null;
+  // ジェスチャーが中断された場合は回転を開始せず、安全に元の状態(現在の角度)へ戻すだけにする。
 }
 
-function animateSignSpin(targetSector, spinSign, rotations) {
-  const targetBearingDeg = targetSector * 45;
-  const startRotation = currentSignRotation;
-  const finalRotation = computeFinalRotation(startRotation, targetBearingDeg, spinSign, rotations);
-  const reducedMotion = prefersReducedMotion();
+/* ---- 回転そのもの: タップ／ボタン／フリックの3系統 → 最終的に runInertiaSpin か
+   簡易トゥイーンのどちらかへ合流し、finishSpin() で8方位への確定を行う。 ---- */
 
+// spinSign(+1/-1) × extraRotations(0/1) の4通りの中から、合計回転量が
+// tapSpinRotationRangeDeg(既定90〜270度)に収まる組み合わせを優先して選ぶ。
+// どれも範囲に収まらない場合（目標方位がすでに現在角度のごく近くにある等）は、
+// レンジの中心に最も近いものへフォールバックする。
+// spinSignは呼び出し元(resolveSpinDirection)で確定済みの回転方向。ここでは、その方向を
+// 維持したまま extraRotations(0または1) だけを選び、合計回転量がレンジに近づくよう調整する。
+// 方向自体をここで選び直すことはしない（それが低速反時計回りの反転バグの原因だったため）。
+function pickTapRotationPlan(startRotation, targetBearingDeg, spinSign) {
+  const [minDeg, maxDeg] = SIGN_PHYSICS.tapSpinRotationRangeDeg;
+  const mid = (minDeg + maxDeg) / 2;
+  const minVisibleDeg = 30; // これ未満の回転量は「動いた」と感じにくいため、可能な限り避ける
+  const candidates = [0, 1].map((extra) => {
+    const finalRotation = computeFinalRotation(startRotation, targetBearingDeg, spinSign, extra);
+    const totalRotation = Math.abs(finalRotation - startRotation);
+    return { spinSign, finalRotation, totalRotation };
+  });
+  const pickClosestToMid = (pool) => {
+    pool.sort((a, b) => Math.abs(a.totalRotation - mid) - Math.abs(b.totalRotation - mid));
+    return pool[0];
+  };
+  const inRange = candidates.filter((c) => c.totalRotation >= minDeg && c.totalRotation <= maxDeg);
+  if (inRange.length > 0) return pickClosestToMid(inRange);
+  // 目標方位が現在角度のごく近くにある等でレンジに収まらない場合は、
+  // 見た目上ほぼ動かなくなる候補を避けつつ、レンジ中心に近いものへフォールバックする。
+  const visible = candidates.filter((c) => c.totalRotation >= minVisibleDeg);
+  return pickClosestToMid(visible.length > 0 ? visible : candidates);
+}
+
+// releaseVelocity: pointerup直前に実測した角速度(NaN/未指定でも可)。
+// 方向はresolveSpinDirection()に一本化し、「回転量が良い方の向きを選ぶ」ことはしない
+// （そうすると低速だが明確なドラッグ方向を持つ操作の向きが無視されてしまうため）。
+function startTapSpin(releaseVelocity) {
+  cancelSignAnimation();
   signSpinning = true;
   el("sign-board").classList.add("spinning");
 
+  const frontier = getFrontierForSign();
+  const targetSector = pickWeightedSector([0, 1, 2, 3, 4, 5, 6, 7], frontier);
+  const startRotation = currentSignRotation;
+  const targetBearingDeg = targetSector * 45;
+  const reducedMotion = prefersReducedMotion();
+  const spinSign = resolveSpinDirection(releaseVelocity);
+  const plan = pickTapRotationPlan(startRotation, targetBearingDeg, spinSign);
+
+  if (pendingReleaseDebug) {
+    pendingReleaseDebug.mappedSpinMagnitude = plan.totalRotation;
+    pendingReleaseDebug.finalSpinVelocity = spinSign;
+    pendingReleaseDebug.snapDirection = spinSign;
+    pendingReleaseDebug.targetAngle = plan.finalRotation;
+    logSignReleaseVelocityDebug();
+  }
+
   if (reducedMotion) {
-    currentSignRotation = finalRotation;
-    applySignRotation(currentSignRotation);
-    setTimeout(() => {
-      signSpinning = false;
-      el("sign-board").classList.remove("spinning");
-      onSignSettled(targetSector);
-    }, 260);
+    currentSignRotation = plan.finalRotation;
+    applySignRotation(currentSignRotation); // reduced-motion用CSSトランジションで短く遷移する
+    logSignDebug("tap-spin", { targetSector, spinSign, plan, reducedMotion });
+    setTimeout(() => finishSpin(targetSector), 220);
     return;
   }
 
-  const overshoot = spinSign * SIGN_OVERSHOOT_DEG;
-  const overshootRotation = finalRotation + overshoot;
-  const duration = Math.max(700, Math.min(3200, rotations * 260 + 500));
-  const settleDuration = 260;
-  const startTime = performance.now();
+  const duration = randRange(SIGN_PHYSICS.tapSpinDurationRangeMs[0], SIGN_PHYSICS.tapSpinDurationRangeMs[1]);
+  logSignDebug("tap-spin", { targetSector, spinSign, plan, duration });
+  tweenRotation(startRotation, plan.finalRotation, duration, () => finishSpin(targetSector));
+}
 
-  function easeOutCubic(t) {
-    return 1 - Math.pow(1 - t, 3);
+function startButtonSpin() {
+  if (signDragState) return; // ドラッグ中はボタン操作を無視する
+  cancelSignAnimation();
+  const spinSign = Math.random() < 0.5 ? -1 : 1;
+  logSignDebug("button-spin", { spinSign, inputVelocity: SIGN_PHYSICS.buttonSpinVelocity });
+  startFlickSpin(SIGN_PHYSICS.buttonSpinVelocity, spinSign); // 中程度のフリック相当の疑似入力を使う
+}
+
+// inputVelocityDegPerMs: pointerup直前に実測した角速度の絶対値(deg/ms)。
+// これを正規化・カーブ変換した上で、慣性回転の初速(deg/ms)へマッピングする。
+function startFlickSpin(inputVelocityDegPerMs, spinSign) {
+  // 安全装置: NaN/Infinityな角速度・符号を物理計算に持ち込まず、安全なタップ扱いにフォールバックする。
+  // releaseVelocityを渡しても resolveSpinDirection() が不正値を検知して
+  // lastSignDragDirection/既定方向へ自動的に落ちるため、方向は失われない。
+  if (!Number.isFinite(inputVelocityDegPerMs) || !Number.isFinite(spinSign)) {
+    startTapSpin(inputVelocityDegPerMs);
+    return;
+  }
+  cancelSignAnimation();
+  const clamped = Math.min(
+    SIGN_PHYSICS.maxInputVelocity,
+    Math.max(SIGN_PHYSICS.minFlickVelocity, Math.abs(inputVelocityDegPerMs))
+  );
+  const normalized = clamp01(
+    (clamped - SIGN_PHYSICS.minFlickVelocity) / (SIGN_PHYSICS.maxInputVelocity - SIGN_PHYSICS.minFlickVelocity)
+  );
+  const curved = Math.pow(normalized, SIGN_PHYSICS.velocityCurvePower);
+  const spinVelocity =
+    SIGN_PHYSICS.minSpinVelocity + curved * (SIGN_PHYSICS.maxSpinVelocity - SIGN_PHYSICS.minSpinVelocity);
+  // 摩擦も入力強度で補間する（弱い入力ほど速く止まり、強い入力ほど長く/多く回る）。
+  const friction =
+    SIGN_PHYSICS.frictionPerFrameAt60fpsMin +
+    curved * (SIGN_PHYSICS.frictionPerFrameAt60fpsMax - SIGN_PHYSICS.frictionPerFrameAt60fpsMin);
+
+  logSignDebug("flick-spin-start", { inputVelocityDegPerMs, spinSign, normalized, curved, spinVelocity, friction });
+  if (pendingReleaseDebug) {
+    pendingReleaseDebug.rawReleaseVelocity = inputVelocityDegPerMs;
+    pendingReleaseDebug.clampedVelocity = clamped;
+    pendingReleaseDebug.mappedSpinVelocity = spinVelocity;
+    pendingReleaseDebug.mappedSpinMagnitude = spinVelocity;
+    pendingReleaseDebug.finalSpinVelocity = spinVelocity * spinSign;
+  }
+  runInertiaSpin(spinVelocity * spinSign, friction);
+}
+
+// pointerup時の実測角速度を初速として、摩擦による減速→8方位への吸着まで駆動する物理ループ。
+// フレームレートに依存しないよう、フレームごとの経過時間(dt)を使って移動量・摩擦を適用する。
+function runInertiaSpin(signedVelocityDegPerMs, frictionPerFrameAt60fps) {
+  signSpinning = true;
+  el("sign-board").classList.add("spinning");
+  spinStartRotationForDebug = currentSignRotation;
+
+  if (prefersReducedMotion()) {
+    finishReducedMotionSpin(signedVelocityDegPerMs);
+    return;
   }
 
+  let velocity = signedVelocityDegPerMs; // deg/ms（符号付き）
+  let lastFrameTime = performance.now();
+  const inertiaStartTime = lastFrameTime;
+
   function step(now) {
-    const elapsed = now - startTime;
-    if (elapsed < duration) {
-      const t = elapsed / duration;
-      currentSignRotation = startRotation + (overshootRotation - startRotation) * easeOutCubic(t);
-      applySignRotation(currentSignRotation);
-      signAnimationFrameId = requestAnimationFrame(step);
+    // 安全装置: 万一ここまでにNaN/Infinityが混入していたら、暴走させず現在角度から即座に吸着させる。
+    if (!Number.isFinite(velocity) || !Number.isFinite(currentSignRotation)) {
+      currentSignRotation = Number.isFinite(currentSignRotation) ? currentSignRotation : 0;
+      const dirSign = signedVelocityDegPerMs >= 0 ? 1 : -1;
+      const frontier = getFrontierForSign();
+      const { targetSector } = pickFlickLandingSector(currentSignRotation, dirSign, frontier);
+      const finalRotation = computeFinalRotation(currentSignRotation, targetSector * 45, dirSign, 0);
+      beginOvershootSettle(currentSignRotation, finalRotation, targetSector, dirSign);
       return;
     }
-    const settleElapsed = elapsed - duration;
-    if (settleElapsed < settleDuration) {
-      const t = settleElapsed / settleDuration;
-      const wobble = Math.sin(t * Math.PI * 2.5) * SIGN_OVERSHOOT_DEG * 0.5 * (1 - t);
-      currentSignRotation = overshootRotation + (finalRotation - overshootRotation) * t + wobble;
-      applySignRotation(currentSignRotation);
-      signAnimationFrameId = requestAnimationFrame(step);
-      return;
-    }
-    currentSignRotation = finalRotation;
+
+    const dt = Math.min(now - lastFrameTime, 48); // フレーム落ち時の1ステップ上限（暴走防止）
+    lastFrameTime = now;
+
+    currentSignRotation += velocity * dt;
     applySignRotation(currentSignRotation);
-    signSpinning = false;
-    el("sign-board").classList.remove("spinning");
-    signAnimationFrameId = null;
-    onSignSettled(targetSector);
+
+    // 摩擦はフレーム数ではなく経過時間に対応させる（60fps基準の係数を時間比でべき乗する）。
+    const frictionFactor = Math.pow(frictionPerFrameAt60fps, dt / (1000 / 60));
+    velocity *= frictionFactor;
+
+    const speed = Math.abs(velocity);
+    const overMaxDuration = now - inertiaStartTime >= SIGN_PHYSICS.maxSpinDurationMs;
+
+    if (speed <= SIGN_PHYSICS.snapVelocityThreshold || overMaxDuration) {
+      const dirSign = velocity !== 0 ? Math.sign(velocity) : signedVelocityDegPerMs >= 0 ? 1 : -1;
+      const frontier = getFrontierForSign();
+      const { natural, targetSector } = pickFlickLandingSector(currentSignRotation, dirSign, frontier);
+      const finalRotation = computeFinalRotation(currentSignRotation, targetSector * 45, dirSign, 0);
+      logSignDebug("inertia-end", {
+        elapsedMs: now - inertiaStartTime,
+        natural,
+        targetSector,
+        finalRotation,
+        overMaxDuration,
+      });
+      if (pendingReleaseDebug) {
+        pendingReleaseDebug.spinDurationMs = now - inertiaStartTime;
+        pendingReleaseDebug.estimatedRotations = Math.abs(currentSignRotation - spinStartRotationForDebug) / 360;
+        pendingReleaseDebug.snapDirection = dirSign;
+        pendingReleaseDebug.targetAngle = finalRotation;
+        logSignReleaseVelocityDebug();
+      }
+      beginOvershootSettle(currentSignRotation, finalRotation, targetSector, dirSign);
+      return;
+    }
+
+    signAnimationFrameId = requestAnimationFrame(step);
   }
 
   signAnimationFrameId = requestAnimationFrame(step);
+}
+
+function finishReducedMotionSpin(signedVelocityDegPerMs) {
+  const dirSign = signedVelocityDegPerMs >= 0 ? 1 : -1;
+  const frontier = getFrontierForSign();
+  const { targetSector } = pickFlickLandingSector(currentSignRotation, dirSign, frontier);
+  // 強さに応じて最大1回転程度まで、短いトランジションで確定する（オーバーシュート・高速回転は行わない）。
+  const strength = clamp01(Math.abs(signedVelocityDegPerMs) / SIGN_PHYSICS.maxSpinVelocity);
+  const rotations = strength > 0.5 ? 1 : 0;
+  const finalRotation = computeFinalRotation(currentSignRotation, targetSector * 45, dirSign, rotations);
+  currentSignRotation = finalRotation;
+  applySignRotation(currentSignRotation); // reduced-motion用CSSトランジションで短く遷移する
+  logSignDebug("reduced-motion-spin", { dirSign, targetSector, finalRotation, strength });
+  if (pendingReleaseDebug) {
+    pendingReleaseDebug.spinDurationMs = 240;
+    pendingReleaseDebug.estimatedRotations = Math.abs(currentSignRotation - spinStartRotationForDebug) / 360;
+    logSignReleaseVelocityDebug();
+  }
+  setTimeout(() => finishSpin(targetSector), 240);
+}
+
+// 慣性減速の終着点(finalRotation)へ向けて、現在の回転方向を保ったまま
+// 数度だけオーバーシュート→小さく戻る、の2段階で自然に吸着させる。
+function beginOvershootSettle(fromRotation, finalRotation, targetSector, dirSign) {
+  const overshootRotation = finalRotation + dirSign * SIGN_PHYSICS.overshootDeg;
+  tweenRotation(fromRotation, overshootRotation, SIGN_PHYSICS.overshootDurationMs, () => {
+    tweenRotation(overshootRotation, finalRotation, SIGN_PHYSICS.settleBackDurationMs, () => {
+      finishSpin(targetSector);
+    });
+  });
+}
+
+// from→toへ、指定ミリ秒かけてease-outで単純に遷移する汎用トゥイーン。
+// フレームレートに依存しないよう経過時間ベースで進捗を計算する。
+function tweenRotation(from, to, durationMs, onDone) {
+  const startTime = performance.now();
+  function step(now) {
+    const t = Math.min(1, (now - startTime) / Math.max(1, durationMs));
+    const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic
+    currentSignRotation = from + (to - from) * eased;
+    applySignRotation(currentSignRotation);
+    if (t < 1) {
+      signAnimationFrameId = requestAnimationFrame(step);
+      return;
+    }
+    signAnimationFrameId = null;
+    onDone();
+  }
+  signAnimationFrameId = requestAnimationFrame(step);
+}
+
+function finishSpin(targetSector) {
+  signSpinning = false;
+  el("sign-board").classList.remove("spinning");
+  logSignDebug("settled", { targetSector, finalRotation: currentSignRotation });
+  onSignSettled(targetSector);
 }
 
 function onSignSettled(sector) {
@@ -863,6 +1360,10 @@ function showDirectionPanel() {
     ? "明るく、人通りのある道を選んでください。標識をはじいて方角を決めよう。"
     : "標識をはじいて、今日進む方角を決めよう。";
   el("sign-sr-status").textContent = "まだ方角は決まっていません。標識を回すボタンで方角を決められます。";
+  // パネルを開くたびに標識の操作状態を安全にリセットする
+  cancelSignAnimation();
+  activeSignPointerId = null;
+  signDragState = null;
 }
 
 function redoDirection() {
@@ -1342,8 +1843,8 @@ window.addEventListener("DOMContentLoaded", () => {
   signBoard.addEventListener("pointerdown", onSignPointerDown);
   signBoard.addEventListener("pointermove", onSignPointerMove);
   signBoard.addEventListener("pointerup", onSignPointerUp);
-  signBoard.addEventListener("pointercancel", onSignPointerUp);
-  el("btn-spin-sign").addEventListener("click", () => triggerSignSpin({ velocityDegPerSec: null }));
+  signBoard.addEventListener("pointercancel", onSignPointerCancel);
+  el("btn-spin-sign").addEventListener("click", startButtonSpin);
   el("btn-redo-direction").addEventListener("click", redoDirection);
   el("btn-confirm-direction").addEventListener("click", confirmDirection);
 

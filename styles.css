@@ -510,6 +510,8 @@ body{
   .frontier-arrow{ transition: none; }
   #frontier-compass{ transition: none; }
   .confetti-piece{ display: none; }
+  /* 標識はJS(rAF)による毎フレーム更新の代わりに、短いCSSトランジションで最終角度へ遷移する */
+  .sign-board{ transition: transform 0.22s ease-out; }
 }
 
 /* Leaflet marker tweak */

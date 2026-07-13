@@ -102,7 +102,7 @@ test("control: monotonic counterclockwise samples keep a counterclockwise releas
   assert.equal(result.resolvedSpinDirection, -1);
 });
 
-test("hypothesis: a same-timestamp clockwise tail sample reverses the resolved direction", (t) => {
+test("regression: a same-timestamp clockwise tail sample keeps the counterclockwise direction", (t) => {
   const result = signPhysics.simulateRelease([
     ...counterclockwiseSamples,
     { timestamp: 80, angleDeg: -1.9 },
@@ -131,12 +131,12 @@ test("hypothesis: a same-timestamp clockwise tail sample reverses the resolved d
   assert.ok(result.cumulativeDelta < 0, "the gesture must remain counterclockwise overall");
   assert.equal(result.lastSignDragDirection, -1, "the recorded drag direction must remain counterclockwise");
   assert.ok(finalSegment.deltaAngle > 0, "the final sample must contain a small clockwise return");
-  assert.ok(finalSegment.deltaTime <= 0.011, "the production timestamp correction must create a tiny interval");
+  assert.equal(finalSegment.deltaTime, 0, "a same-timestamp segment must not receive an artificial duration");
   assert.ok(
-    result.releaseVelocity >= signPhysics.minDirectionalVelocity,
-    "the calculated positive release velocity must outrank the drag-direction fallback"
+    result.releaseVelocity < signPhysics.minDirectionalVelocity,
+    "the same-timestamp tail must not become a trusted positive release velocity"
   );
-  assert.equal(result.resolvedSpinDirection, 1);
+  assert.equal(result.resolvedSpinDirection, -1);
 });
 
 test("control: the same clockwise tail over a normal interval does not reverse the direction", () => {

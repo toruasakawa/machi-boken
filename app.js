@@ -880,8 +880,9 @@ function recordSignPointerSample(sample) {
     signDragState.directionRefDelta = signDragState.cumulativeDelta;
   }
 
-  // timeStampが前サンプル以前(逆行・重複)の場合は、順序を保つため直前+微小値へ補正する
-  const timestamp = last && rawTimestamp <= last.timestamp ? last.timestamp + 0.01 : rawTimestamp;
+  // timeStampが逆行した場合は直前値へ丸め、同時刻区間は速度計算側のdt<=0判定で除外する。
+  // 架空の微小時間を足すと、指を離す瞬間の小さな戻りが極端な角速度へ増幅されるため。
+  const timestamp = last ? Math.max(rawTimestamp, last.timestamp) : rawTimestamp;
   history.push({ angle: currentSignRotation, timestamp });
 }
 

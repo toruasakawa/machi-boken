@@ -2,21 +2,37 @@
    マチ冒険 MVP — 未踏セル開放 × 勾配クエスト
    ========================================================== */
 
-const CELL_SIZE_M = 200;        // 1セルの一辺（メートル）
-const QUEST_RING_CELLS = 4;     // 現在地から何セル分の範囲でクエスト候補を探すか（≒800m）
+const CELL_SIZE_M = 200; // 1セルの一辺（メートル）
+const QUEST_RING_CELLS = 4; // 現在地から何セル分の範囲でクエスト候補を探すか（≒800m）
 const MAX_QUEST_CANDIDATES = 10; // 標高APIに投げる候補数の上限
 const ELEVATION_ENDPOINT = "https://api.open-elevation.com/api/v1/lookup";
 const ELEVATION_TIMEOUT_MS = 8000; // 標高APIが固まった場合に諦めるまでの時間
 
-const ACCURACY_OPEN_M = 60;   // これより誤差が大きい測位ではセル開放/クエスト達成の判定に使わない
-const ACCURACY_WARN_M = 100;  // これより誤差が大きい場合はユーザーに知らせる
+const ACCURACY_OPEN_M = 60; // これより誤差が大きい測位ではセル開放/クエスト達成の判定に使わない
+const ACCURACY_WARN_M = 100; // これより誤差が大きい場合はユーザーに知らせる
 const ACCURACY_WARN_INTERVAL_MS = 15000; // 精度低下トーストを連発させないための間隔
 
 // フロンティア・コンパス: 8方位ラベル（北を0として45度刻み・時計回り）
 const COMPASS_LABELS = ["北", "北東", "東", "南東", "南", "南西", "西", "北西"];
-const FRONTIER_COLLAPSE_DISTANCE_M = 30;  // 累積移動がこれを超えたら展開→縮小に切り替える
+const FRONTIER_COLLAPSE_DISTANCE_M = 30; // 累積移動がこれを超えたら展開→縮小に切り替える
 const FRONTIER_RECOMPUTE_DISTANCE_M = 100; // 前回の再計算地点からこれだけ動いたら方角を再計算する
 const FRONTIER_SWITCH_MARGIN = 2; // 新しい方位の未踏セル数が現在の提案より何件以上多ければ切り替えるか（僅差ならちらつき防止のため維持）
+
+// 未踏セルの霧・目標セル発光（体験仮説の検証用・軽量実装）。実機調整はこのオブジェクトだけで完結させる。
+const CELL_FOG_CONFIG = {
+  enabled: true, // 全体のON/OFFスイッチ（検証を止めたい場合はfalseにするだけでよい）
+  ringCells: QUEST_RING_CELLS, // 霧を描く範囲。クエスト探索と同じ半径(±4セル≒800m四方)を流用し、無制限生成を防ぐ
+  fillColor: "#eef2f3", // 霧の塗り色（白系。地図が灰色の格子に見えすぎない濃さへ調整可）
+  fillOpacity: 0.8,
+  strokeColor: "#ffffff",
+  strokeOpacity: 0.25,
+  strokeWeight: 1,
+  revealDurationMs: 700, // 霧が晴れる演出の所要時間（styles.cssの.map-cell-fogの transition と合わせること）
+  targetPulseDurationMs: 2200, // 対象セル発光の呼吸周期の目安（styles.cssのtarget-cell-breatheと合わせること）
+  targetMaxSteps: 4, // 確定方角に沿って最初の未踏セルを探す最大セル数（無限探索を避ける）
+  maxRenderedFogCells: 100, // 霧レイヤーの上限。モバイルでのDOM/SVG要素数を保護する
+};
+const DEBUG_CELL_FOG = false; // trueにすると霧・対象セルの計測値をコンソールへ出力する（本番はfalse）
 
 // 冒険プリセット: 時間は厳密なタイマーではなく「新しく開放するセル数」の目安として使う。
 // 値を変えたい場合はここだけ調整すればよい。
@@ -58,27 +74,27 @@ const DIRECTION_WEIGHT_BY_DISTANCE = [10, 5, 2, 1, 1];
 // 道路標識（方向決定UI）の物理定数。実機調整はこのオブジェクトだけで完結するようにする。
 // 単位は角度=度(deg)、角速度=度/ミリ秒(deg/ms)で統一している。
 const SIGN_PHYSICS = {
-  historyWindowMs: 150,        // pointerup直前、角速度算出に使う履歴の時間窓
-  minVelocitySampleDt: 8,      // 角速度算出に使う最古〜最新サンプルの最小間隔(ms未満は採用しない)
-  tapMaxAngleDeg: 6,           // これ未満の正味移動量ならタップ候補
-  tapMaxDurationMs: 250,       // これ未満の操作時間ならタップ候補
-  minFlickVelocity: 0.06,      // これ未満の角速度(deg/ms)は事実上タップ扱い（フリックの下限でもある）
-  maxInputVelocity: 1.6,       // 入力角速度(deg/ms)の実測上限の目安。これ以上はclampする
-  minSpinVelocity: 3.9,        // 慣性回転の初速下限(deg/ms)（タップ以外の最弱フリック）
-  maxSpinVelocity: 5.7,        // 慣性回転の初速上限(deg/ms)（最強フリック）
-  velocityCurvePower: 0.7,     // 入力強度→初速・摩擦のカーブ指数(1未満で弱入力側の差を強調)
+  historyWindowMs: 150, // pointerup直前、角速度算出に使う履歴の時間窓
+  minVelocitySampleDt: 8, // 角速度算出に使う最古〜最新サンプルの最小間隔(ms未満は採用しない)
+  tapMaxAngleDeg: 6, // これ未満の正味移動量ならタップ候補
+  tapMaxDurationMs: 250, // これ未満の操作時間ならタップ候補
+  minFlickVelocity: 0.06, // これ未満の角速度(deg/ms)は事実上タップ扱い（フリックの下限でもある）
+  maxInputVelocity: 1.6, // 入力角速度(deg/ms)の実測上限の目安。これ以上はclampする
+  minSpinVelocity: 3.9, // 慣性回転の初速下限(deg/ms)（タップ以外の最弱フリック）
+  maxSpinVelocity: 5.7, // 慣性回転の初速上限(deg/ms)（最強フリック）
+  velocityCurvePower: 0.7, // 入力強度→初速・摩擦のカーブ指数(1未満で弱入力側の差を強調)
   // 摩擦は初速に応じて可変にする（強い入力ほど摩擦を弱めて長く/多く回るようにし、
   // 回転数と停止時間の両方が入力強度に連動して伸びるようにする）。
   frictionPerFrameAt60fpsMin: 0.878, // 最弱フリック時の摩擦係数（小さいほど速く減速）
   frictionPerFrameAt60fpsMax: 0.949, // 最強フリック時の摩擦係数（大きいほどゆっくり減速＝長く回る）
   snapVelocityThreshold: 0.02, // 角速度がこれ未満まで減衰したら吸着フェーズへ移行(deg/ms)
-  overshootDeg: 4,             // 吸着直前の小さなオーバーシュート量(度)
-  overshootDurationMs: 200,    // オーバーシュート角度までの所要時間
-  settleBackDurationMs: 150,   // オーバーシュートから最終角度へ戻る所要時間
-  maxSpinDurationMs: 2500,     // 慣性回転フェーズの最大許容時間（安全装置。これを超えたら強制的に吸着へ）
+  overshootDeg: 4, // 吸着直前の小さなオーバーシュート量(度)
+  overshootDurationMs: 200, // オーバーシュート角度までの所要時間
+  settleBackDurationMs: 150, // オーバーシュートから最終角度へ戻る所要時間
+  maxSpinDurationMs: 2500, // 慣性回転フェーズの最大許容時間（安全装置。これを超えたら強制的に吸着へ）
   tapSpinRotationRangeDeg: [90, 270], // タップ時の回転量の目安レンジ(度。0.25〜0.75回転相当)
   tapSpinDurationRangeMs: [500, 900], // タップ時の停止フェーズ所要時間の目安レンジ
-  buttonSpinVelocity: 0.55,    // 「標識を回す」ボタン押下時に使う疑似入力速度(deg/ms、中程度のフリック相当)
+  buttonSpinVelocity: 0.55, // 「標識を回す」ボタン押下時に使う疑似入力速度(deg/ms、中程度のフリック相当)
 };
 
 const DEBUG_SIGN_PHYSICS = false; // trueにすると操作の計測値・分類・初速などをコンソールへ出力する
@@ -86,14 +102,14 @@ const DEBUG_SIGN_PHYSICS = false; // trueにすると操作の計測値・分類
 // pointerup直前のリリース角速度をどう算出するかの設定。
 // 「最後だけ強くはじく」操作を、履歴全体の平均で薄めずに正しく拾うことが目的。
 const SIGN_RELEASE_VELOCITY = {
-  preferredWindowMs: 80,    // まずこの時間内(直近)のサンプルだけで速度を計算する
-  fallbackWindowMs: 150,    // 直近サンプルが不十分なら、ここまで範囲を広げる
-  minimumWindowMs: 24,      // これ未満の時間差では信頼できる速度が出せない
-  minimumSampleCount: 3,    // 採用ウィンドウ内に必要な最小サンプル数
-  recencyWeightPower: 2,    // 直近ほど重みを強める指数（大きいほど最新区間を強調）
-  recencyWeightMax: 3,      // 直近区間に上乗せされる重みの最大値（基本重み1 + これ）
-  maxSegmentVelocity: 50,   // 1区間の角速度がこれを超えたら明らかな外れ値として除外する(deg/ms)
-  usePeakBlend: true,       // 加重平均だけでなく、直近ピーク速度も少量ブレンドするか
+  preferredWindowMs: 80, // まずこの時間内(直近)のサンプルだけで速度を計算する
+  fallbackWindowMs: 150, // 直近サンプルが不十分なら、ここまで範囲を広げる
+  minimumWindowMs: 24, // これ未満の時間差では信頼できる速度が出せない
+  minimumSampleCount: 3, // 採用ウィンドウ内に必要な最小サンプル数
+  recencyWeightPower: 2, // 直近ほど重みを強める指数（大きいほど最新区間を強調）
+  recencyWeightMax: 3, // 直近区間に上乗せされる重みの最大値（基本重み1 + これ）
+  maxSegmentVelocity: 50, // 1区間の角速度がこれを超えたら明らかな外れ値として除外する(deg/ms)
+  usePeakBlend: true, // 加重平均だけでなく、直近ピーク速度も少量ブレンドするか
 };
 // 加重平均とピーク速度のブレンド比率（usePeakBlend時のみ使用）。
 const RELEASE_VELOCITY_BLEND = {
@@ -133,9 +149,9 @@ const store = {
 };
 
 let origin = store.get(STORAGE_KEYS.origin, null); // {lat0, lon0}
-let visited = store.get(STORAGE_KEYS.visited, {});  // { "ix_iy": {ts,lat,lon} }
-let quest = store.get(STORAGE_KEYS.quest, null);    // {ix, iy, gradient, lat, lon}
-let log = store.get(STORAGE_KEYS.log, []);          // [{ts, type, label}]
+let visited = store.get(STORAGE_KEYS.visited, {}); // { "ix_iy": {ts,lat,lon} }
+let quest = store.get(STORAGE_KEYS.quest, null); // {ix, iy, gradient, lat, lon}
+let log = store.get(STORAGE_KEYS.log, []); // [{ts, type, label}]
 
 /* ---------- 座標・グリッド変換 ---------- */
 const M_PER_DEG_LAT = 111320;
@@ -199,10 +215,18 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
 /* ---------- 地図 ---------- */
 let map, cellsLayer, questLayer, meMarker;
 
+// 未踏セルの霧・目標セル発光の状態（すべてセッション限定。localStorageへは保存しない）
+let fogLayer = null; // 霧レイヤー（L.layerGroup）
+const fogLayersByCellId = new Map(); // セルID -> 霧のLeafletレイヤー（重複防止・差分更新用）
+let lastFogCenterCell = null; // 直近に霧を再計算した中心セル（無駄な再計算を防ぐ）
+let activeTargetCell = null; // {ix, iy} | null — 現在発光中の最初の未踏セル（強制目標ではない）
+let activeTargetGlowLayer = null; // 対象セルの発光レイヤー
+let targetCellRevealStarted = false; // 到達演出（霧解除・発光解除）の多重実行防止ガード
+
 function initMap(lat, lon) {
   map = L.map("map", { zoomControl: false, attributionControl: false }).setView(
     [lat, lon],
-    17
+    17,
   );
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 19,
@@ -210,6 +234,16 @@ function initMap(lat, lon) {
   }).addTo(map);
   L.control.attribution({ prefix: false, position: "bottomleft" }).addTo(map);
 
+  // 霧・目標発光は専用paneに分離し、タイル→霧→訪問済み→目標発光→現在地の順に重ねる。
+  // pane自体にpointer-events:noneを設定することで、地図のドラッグ・ズーム・タップを一切妨げない。
+  const fogPane = map.createPane("fogPane");
+  fogPane.style.zIndex = 350; // tilePane(200) < fogPane < overlayPane(400, 訪問済みセル・現在地)
+  fogPane.style.pointerEvents = "none";
+  const targetGlowPane = map.createPane("targetGlowPane");
+  targetGlowPane.style.zIndex = 410; // overlayPane(400)の上＝訪問済み色より前面に発光を出す
+  targetGlowPane.style.pointerEvents = "none";
+
+  fogLayer = L.layerGroup().addTo(map);
   cellsLayer = L.layerGroup().addTo(map);
   questLayer = L.layerGroup().addTo(map);
 
@@ -270,13 +304,187 @@ function drawQuestMarker(q) {
   marker.on("click", () => openQuestPanel());
 }
 
+/* ==========================================================
+   未踏セルの霧・目標セル発光（体験仮説の検証用・軽量実装）
+   - 霧: 現在地周辺(CELL_FOG_CONFIG.ringCells圏内)の未踏セルにだけ薄い半透明レイヤーを表示する
+   - 発光: 標識で方角が確定した直後、その方向の最初の未踏セルを1つだけ淡く光らせる
+     （強制的な目的地ではなく、進んだ先に何かありそうという程度の手がかり）
+   状態はすべてセッション限定。visited(既存データ)から毎回導出するため、localStorageは変更しない。
+   ========================================================== */
+function logCellFogDebug(event, extra) {
+  if (!DEBUG_CELL_FOG) return;
+  console.log("[cell-fog]", event, {
+    visibleFogCellCount: fogLayersByCellId.size,
+    activeTargetCellId: activeTargetCell
+      ? cellKey(activeTargetCell.ix, activeTargetCell.iy)
+      : null,
+    targetDirection: adventureState.direction
+      ? adventureState.direction.sector
+      : null,
+    ...extra,
+  });
+}
+
+// 現在地を中心に、visitedに基づいて霧セルの表示を差分更新する。
+// 中心セル(ix,iy)が変わらない限り再計算しないため、GPS更新のたびに全レイヤーを作り直すことはない。
+function updateFogCells(lat, lon) {
+  if (!CELL_FOG_CONFIG.enabled || !map || !fogLayer) return;
+
+  const { ix: cix, iy: ciy } = cellIndex(lat, lon);
+  if (
+    lastFogCenterCell &&
+    lastFogCenterCell.ix === cix &&
+    lastFogCenterCell.iy === ciy
+  )
+    return;
+  lastFogCenterCell = { ix: cix, iy: ciy };
+
+  const ring = CELL_FOG_CONFIG.ringCells;
+  const desired = new Set();
+  for (let dx = -ring; dx <= ring; dx++) {
+    for (let dy = -ring; dy <= ring; dy++) {
+      const key = cellKey(cix + dx, ciy + dy);
+      if (visited[key]) continue; // 訪問済みセルには霧を出さない
+      desired.add(key);
+    }
+  }
+
+  // 範囲外になった霧を削除する（移動でレイヤー数が際限なく増え続けないようにする）
+  fogLayersByCellId.forEach((rect, key) => {
+    if (desired.has(key)) return;
+    fogLayer.removeLayer(rect);
+    fogLayersByCellId.delete(key);
+  });
+
+  // 不足分だけ追加する（既に霧があるセルは再生成しない＝重複防止）
+  desired.forEach((key) => {
+    if (fogLayersByCellId.has(key)) return;
+    if (fogLayersByCellId.size >= CELL_FOG_CONFIG.maxRenderedFogCells) return; // 性能保護の上限
+    const [ix, iy] = key.split("_").map(Number);
+    const rect = L.rectangle(cellBoundsLatLon(ix, iy), {
+      pane: "fogPane",
+      interactive: false,
+      className: "map-cell-fog",
+      color: CELL_FOG_CONFIG.strokeColor,
+      opacity: CELL_FOG_CONFIG.strokeOpacity,
+      weight: CELL_FOG_CONFIG.strokeWeight,
+      fillColor: CELL_FOG_CONFIG.fillColor,
+      fillOpacity: CELL_FOG_CONFIG.fillOpacity,
+    }).addTo(fogLayer);
+    fogLayersByCellId.set(key, rect);
+  });
+
+  logCellFogDebug("fog-updated", {});
+}
+
+// 対象セル(ix,iy)の霧を「晴れる」演出付きで解除する。発光対象かどうかは問わない
+// （発光対象以外の未踏セルへ到達した場合も、控えめだが同じ晴れ方をする）。
+function revealFogCell(ix, iy) {
+  const key = cellKey(ix, iy);
+  const rect = fogLayersByCellId.get(key);
+  if (!rect) return; // 圏外や既に霧が無いセルは何もしない
+  fogLayersByCellId.delete(key); // 同じセルへの多重解除を防ぐため、先にMapから外す
+
+  const finish = () => {
+    if (fogLayer) fogLayer.removeLayer(rect);
+    logCellFogDebug("fog-reveal-completed", {
+      currentCellId: key,
+      revealCompleted: true,
+    });
+  };
+
+  const path = rect._path; // LeafletのSVGパス実体。CSSトランジションで霧を晴らすために直接参照する
+  if (path && !prefersReducedMotion()) {
+    path.classList.add("is-revealing");
+    setTimeout(finish, CELL_FOG_CONFIG.revealDurationMs + 60);
+  } else {
+    finish(); // reduced-motion、またはパス未取得時は即時解除する
+  }
+}
+
+// 確定方角(sector)へ向かって現在地セルから1セルずつ調べ、最初の未踏セルを返す。無限探索は行わない。
+function findFirstUnvisitedCellAlongDirection(cix, ciy, sector, maxSteps) {
+  const bearingRad = (sector * 45 * Math.PI) / 180;
+  const stepX = Math.round(Math.sin(bearingRad));
+  const stepY = Math.round(Math.cos(bearingRad));
+  for (let step = 1; step <= maxSteps; step++) {
+    const ix = cix + stepX * step;
+    const iy = ciy + stepY * step;
+    if (!visited[cellKey(ix, iy)]) return { ix, iy, step };
+  }
+  return null; // 見つからなくても呼び出し側は発光なしで冒険を継続できる
+}
+
+function drawTargetCellGlow(ix, iy) {
+  if (!map) return;
+  activeTargetGlowLayer = L.rectangle(cellBoundsLatLon(ix, iy), {
+    pane: "targetGlowPane",
+    interactive: false,
+    className: "target-cell-glow",
+    color: "#bff3e6", // 白〜淡い青緑系。クエスト旗や視認済み色（amber）と混同しないようにする
+    weight: 2,
+    fillColor: "#eafaf5",
+  }).addTo(map);
+}
+
+// 標識で方角が確定するたび（やり直し含む）呼ばれ、その方向の最初の未踏セルを1つだけ発光させる。
+function selectAndShowTargetCell() {
+  clearTargetCell(); // 前回の対象を必ず解除してから選び直す（方向再決定時の重複防止）
+  if (!CELL_FOG_CONFIG.enabled || !adventureState.direction || !lastKnownLatLon)
+    return;
+
+  const { ix: cix, iy: ciy } = cellIndex(
+    lastKnownLatLon.lat,
+    lastKnownLatLon.lon,
+  );
+  const found = findFirstUnvisitedCellAlongDirection(
+    cix,
+    ciy,
+    adventureState.direction.sector,
+    CELL_FOG_CONFIG.targetMaxSteps,
+  );
+
+  logCellFogDebug("target-selected", {
+    targetStepDistance: found ? found.step : null,
+    activeTargetCellId: found ? cellKey(found.ix, found.iy) : null,
+  });
+
+  if (!found) return; // 見つからない場合も発光なしで冒険開始できるようにする（強制目標ではない）
+
+  activeTargetCell = { ix: found.ix, iy: found.iy };
+  targetCellRevealStarted = false;
+  drawTargetCellGlow(found.ix, found.iy);
+}
+
+// 対象セルの発光を一度だけ強くしてから、clearTargetCell()側のタイマーで片付ける合図を出す。
+function flashTargetGlow() {
+  if (!activeTargetGlowLayer) return;
+  const path = activeTargetGlowLayer._path;
+  if (path && !prefersReducedMotion()) {
+    path.classList.add("is-flashing");
+  }
+}
+
+// 発光解除。冒険終了・中断・方向再決定・状態リセットなど、既存のリセット経路から呼ばれる。
+// 霧そのもの(fogLayer)は消さない——地図表示中は維持してよい仕様のため。
+function clearTargetCell() {
+  if (activeTargetGlowLayer && map) {
+    map.removeLayer(activeTargetGlowLayer);
+  }
+  activeTargetGlowLayer = null;
+  activeTargetCell = null;
+  targetCellRevealStarted = false;
+}
+
 /* ---------- HUD / パネル操作 ---------- */
 const el = (id) => document.getElementById(id);
 
 function updateHud(currentLat, currentLon) {
   el("stat-cells").textContent = Object.keys(visited).length;
   if (quest) {
-    const d = Math.round(haversineMeters(currentLat, currentLon, quest.lat, quest.lon));
+    const d = Math.round(
+      haversineMeters(currentLat, currentLon, quest.lat, quest.lon),
+    );
     el("stat-quest").textContent = `${d}m`;
   } else {
     el("stat-quest").textContent = "--";
@@ -294,15 +502,21 @@ function showToast(msg, variant) {
 }
 
 function prefersReducedMotion() {
-  return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  return !!(
+    window.matchMedia &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
 }
 
 function openQuestPanel() {
   el("quest-panel").classList.remove("hidden");
   if (quest) {
-    el("quest-desc").textContent = "近くの坂・段差候補。到達すると開放されます。";
+    el("quest-desc").textContent =
+      "近くの坂・段差候補。到達すると開放されます。";
     el("quest-gradient").textContent =
-      quest.gradientPct != null ? `勾配目安 ${quest.gradientPct}%` : "勾配 不明";
+      quest.gradientPct != null
+        ? `勾配目安 ${quest.gradientPct}%`
+        : "勾配 不明";
   } else {
     el("quest-desc").textContent = "周辺を探索するとクエストが見つかります。";
     el("quest-gradient").textContent = "";
@@ -430,13 +644,15 @@ function computeFrontierDirection(curLat, curLon, previousSector) {
       const c = cellCenterLatLon(ix, iy);
       const cXY = toMeters(c.lat, c.lon);
       const bearingDeg =
-        (Math.atan2(cXY.x - curXY.x, cXY.y - curXY.y) * 180 / Math.PI + 360) % 360;
+        ((Math.atan2(cXY.x - curXY.x, cXY.y - curXY.y) * 180) / Math.PI + 360) %
+        360;
       const sector = Math.round(bearingDeg / 45) % 8;
       const dist = haversineMeters(curLat, curLon, c.lat, c.lon);
 
       counts[sector]++;
       totalUnvisited++;
-      if (dist < nearestDistBySector[sector]) nearestDistBySector[sector] = dist;
+      if (dist < nearestDistBySector[sector])
+        nearestDistBySector[sector] = dist;
     }
   }
 
@@ -480,14 +696,15 @@ function computeFrontierDirection(curLat, curLon, previousSector) {
 // 表示状態: 'expanded'（矢印+ラベル+閉じるボタン）/ 'collapsed'（矢印アイコンのみ）/
 // 'hidden-this-session'（×で閉じた。今回のセッション中のみ非表示。リロードで自動的にexpandedへ戻る）
 let compassState = "expanded";
-let compassResult = null;          // 直近のcomputeFrontierDirection()の結果
+let compassResult = null; // 直近のcomputeFrontierDirection()の結果
 let lastCompassCheckLatLon = null; // 最後に方位を再計算した地点（100m移動判定の基準）
-let compassMoveBaseLatLon = null;  // 累積移動距離を測るための直近地点（30m縮小判定の基準）
-let compassMoveAccumM = 0;         // 縮小判定用の累積移動距離
-let lastKnownLatLon = null;        // タップで再展開した際に即座に再計算するための直近位置
+let compassMoveBaseLatLon = null; // 累積移動距離を測るための直近地点（30m縮小判定の基準）
+let compassMoveAccumM = 0; // 縮小判定用の累積移動距離
+let lastKnownLatLon = null; // タップで再展開した際に即座に再計算するための直近位置
 
 function recomputeCompass(lat, lon) {
-  const prevSector = compassResult && compassResult.hasFrontier ? compassResult.sector : null;
+  const prevSector =
+    compassResult && compassResult.hasFrontier ? compassResult.sector : null;
   compassResult = computeFrontierDirection(lat, lon, prevSector);
   lastCompassCheckLatLon = { lat, lon };
   renderCompass();
@@ -512,7 +729,8 @@ function renderCompass() {
     label.classList.add("hidden");
     closeBtn.classList.add("hidden");
     arrow.classList.toggle("hidden", !hasFrontier);
-    if (hasFrontier) arrow.style.transform = `rotate(${compassResult.bearingDeg}deg)`;
+    if (hasFrontier)
+      arrow.style.transform = `rotate(${compassResult.bearingDeg}deg)`;
     return;
   }
 
@@ -555,7 +773,12 @@ function updateFrontierCompassFlow(lat, lon, reliable) {
   if (!compassMoveBaseLatLon) {
     compassMoveBaseLatLon = { lat, lon };
   } else if (compassState === "expanded") {
-    compassMoveAccumM += haversineMeters(compassMoveBaseLatLon.lat, compassMoveBaseLatLon.lon, lat, lon);
+    compassMoveAccumM += haversineMeters(
+      compassMoveBaseLatLon.lat,
+      compassMoveBaseLatLon.lon,
+      lat,
+      lon,
+    );
     compassMoveBaseLatLon = { lat, lon };
     if (compassMoveAccumM >= FRONTIER_COLLAPSE_DISTANCE_M) {
       compassState = "collapsed";
@@ -567,8 +790,12 @@ function updateFrontierCompassFlow(lat, lon, reliable) {
 
   const needsRecompute =
     !lastCompassCheckLatLon ||
-    haversineMeters(lastCompassCheckLatLon.lat, lastCompassCheckLatLon.lon, lat, lon) >=
-      FRONTIER_RECOMPUTE_DISTANCE_M;
+    haversineMeters(
+      lastCompassCheckLatLon.lat,
+      lastCompassCheckLatLon.lon,
+      lat,
+      lon,
+    ) >= FRONTIER_RECOMPUTE_DISTANCE_M;
 
   if (needsRecompute) {
     recomputeCompass(lat, lon);
@@ -598,7 +825,10 @@ function renderAdventureUI() {
   el("direction-panel").classList.toggle("hidden", s !== "choosingDirection");
   el("adventure-hud").classList.toggle("hidden", s !== "active");
   el("completion-sheet").classList.toggle("hidden", s !== "completed");
-  el("btn-begin-adventure").classList.toggle("hidden", !(s === "idle" || s === "completed"));
+  el("btn-begin-adventure").classList.toggle(
+    "hidden",
+    !(s === "idle" || s === "completed"),
+  );
 }
 
 function setAdventureStatus(status) {
@@ -615,11 +845,13 @@ function resetAdventureStateKeepHistory() {
   adventureState.startLatLon = null;
   adventureState.targetReached = false;
   adventureState.sessionDiscoveredCellIds = [];
+  clearTargetCell(); // 冒険の再開始・終了時は対象セルの発光を必ず解除する（霧そのものは維持してよい）
 }
 
 function renderAdventureHud() {
   if (!adventureState.direction) return;
-  el("adventure-hud-direction").textContent = `${adventureState.direction.label}へ冒険中`;
+  el("adventure-hud-direction").textContent =
+    `${adventureState.direction.label}へ冒険中`;
   el("adventure-hud-progress").textContent =
     `新しい場所 ${adventureState.discoveredCells} / ${adventureState.targetCells}`;
 }
@@ -627,7 +859,8 @@ function renderAdventureHud() {
 // アプリ起動後、初回の位置取得・地図準備が完了した直後に一度だけ呼ばれる（handlePosition内）。
 // それ以外に、地図画面の「冒険開始」ボタンからも同じ入口を使う。
 function beginAdventureFlow() {
-  if (adventureState.status !== "idle" && adventureState.status !== "completed") return;
+  if (adventureState.status !== "idle" && adventureState.status !== "completed")
+    return;
   if (isNightTime()) {
     showNightWarning();
   } else {
@@ -637,6 +870,7 @@ function beginAdventureFlow() {
 
 function endAdventure() {
   if (adventureState.status !== "active") return;
+  clearTargetCell(); // 冒険終了時は対象セルの発光を解除する
   setAdventureStatus("completed");
   showCompletionSheet();
 }
@@ -665,10 +899,13 @@ function hideNightWarning() {
 function renderDurationOptions() {
   ADVENTURE_PRESET_ORDER.forEach((key) => {
     const preset = ADVENTURE_PRESETS[key];
-    const btn = document.querySelector(`.duration-option[data-preset="${key}"]`);
+    const btn = document.querySelector(
+      `.duration-option[data-preset="${key}"]`,
+    );
     if (!btn) return;
     btn.querySelector(".duration-minutes").textContent = `${preset.minutes}分`;
-    btn.querySelector(".duration-desc").textContent = `新しい場所を${preset.targetCells}つ`;
+    btn.querySelector(".duration-desc").textContent =
+      `新しい場所を${preset.targetCells}つ`;
   });
 }
 
@@ -696,7 +933,7 @@ function selectAdventurePreset(presetKey) {
    回転そのものは pointerup 直前の実測角速度を初速とした摩擦(慣性)物理で駆動する。
    タップ/フリックの強弱が回転速度・回転数・停止時間へ連続的に反映されることが目的。 */
 let signSpinning = false;
-let signDragState = null;   // {center, lastAngle, cumulativeDelta, startRotation, downTime, browserEventCount, coalescedSampleCount, history:[{angle,timestamp}]}
+let signDragState = null; // {center, lastAngle, cumulativeDelta, startRotation, downTime, browserEventCount, coalescedSampleCount, history:[{angle,timestamp}]}
 let currentSignRotation = 0;
 let signAnimationFrameId = null;
 let activeSignPointerId = null; // 複数ポインター同時操作を防ぐため、操作中のpointerIdを1つだけ保持する
@@ -713,7 +950,10 @@ const DEFAULT_TAP_SPIN_DIRECTION = 1; // 方向情報が一切無い完全なタ
 // 2) 低速でも直前に観測された実際のドラッグ方向 3) 完全なタップの既定方向。
 // releaseVelocityがNaN/Infinity・小さすぎる場合でも、ユーザーの入力方向を勝手に反転させないためのもの。
 function resolveSpinDirection(releaseVelocity) {
-  if (Number.isFinite(releaseVelocity) && Math.abs(releaseVelocity) >= MIN_DIRECTIONAL_VELOCITY) {
+  if (
+    Number.isFinite(releaseVelocity) &&
+    Math.abs(releaseVelocity) >= MIN_DIRECTIONAL_VELOCITY
+  ) {
     return Math.sign(releaseVelocity);
   }
   if (lastSignDragDirection !== 0) {
@@ -772,15 +1012,22 @@ function pickFlickLandingSector(currentRotation, dirSign, frontierResult) {
   const natural = Math.round(mod / 45) % 8;
   const rawCandidates = [natural, (natural + 7) % 8, (natural + 1) % 8];
   const reachable = rawCandidates.filter((s) => {
-    const delta = computeFinalRotation(currentRotation, s * 45, dirSign, 0) - currentRotation;
+    const delta =
+      computeFinalRotation(currentRotation, s * 45, dirSign, 0) -
+      currentRotation;
     return Math.abs(delta) <= MAX_NATURAL_SNAP_DELTA_DEG;
   });
   const candidates = reachable.length > 0 ? reachable : [natural];
-  return { natural, candidates, targetSector: pickWeightedSector(candidates, frontierResult) };
+  return {
+    natural,
+    candidates,
+    targetSector: pickWeightedSector(candidates, frontierResult),
+  };
 }
 
 function getFrontierForSign() {
-  const refLatLon = lastKnownLatLon || (origin ? { lat: origin.lat0, lon: origin.lon0 } : null);
+  const refLatLon =
+    lastKnownLatLon || (origin ? { lat: origin.lat0, lon: origin.lon0 } : null);
   if (!refLatLon) return { hasFrontier: false };
   if (compassResult && compassResult.hasFrontier) return compassResult;
   return computeFrontierDirection(refLatLon.lat, refLatLon.lon);
@@ -817,7 +1064,12 @@ function cancelSignAnimation() {
 
 // current(現在の回転角、度・無制限) から、spinSignの向きを保ったまま targetBearingDeg(0-359)へ
 // extraRotations回分の360度を追加してから到達する最終回転角を返す。
-function computeFinalRotation(current, targetBearingDeg, spinSign, extraRotations) {
+function computeFinalRotation(
+  current,
+  targetBearingDeg,
+  spinSign,
+  extraRotations,
+) {
   const currentMod = ((current % 360) + 360) % 360;
   const deltaCW = (targetBearingDeg - currentMod + 360) % 360;
   const delta = spinSign >= 0 ? deltaCW : deltaCW === 0 ? 0 : deltaCW - 360;
@@ -826,7 +1078,10 @@ function computeFinalRotation(current, targetBearingDeg, spinSign, extraRotation
 
 function trimPointerHistory(history, now) {
   // 直近 historyWindowMs 分だけを残す。ただし速度算出には最低2点必要なので2点は必ず残す。
-  while (history.length > 2 && now - history[0].timestamp > SIGN_PHYSICS.historyWindowMs) {
+  while (
+    history.length > 2 &&
+    now - history[0].timestamp > SIGN_PHYSICS.historyWindowMs
+  ) {
     history.shift();
   }
 }
@@ -849,22 +1104,35 @@ function getPointerSamples(event) {
 // 角度差の正規化・累積回転・履歴追加をまとめて行う。異常サンプルや完全な重複は無視する。
 function recordSignPointerSample(sample) {
   if (!signDragState) return;
-  if (sample.pointerId != null && sample.pointerId !== activeSignPointerId) return; // 他ポインターのサンプルは無視
-  const angle = angleFromCenter(sample.clientX, sample.clientY, signDragState.center);
+  if (sample.pointerId != null && sample.pointerId !== activeSignPointerId)
+    return; // 他ポインターのサンプルは無視
+  const angle = angleFromCenter(
+    sample.clientX,
+    sample.clientY,
+    signDragState.center,
+  );
   if (!Number.isFinite(angle)) return; // 座標異常なサンプルは除外
 
   const history = signDragState.history;
   const last = history[history.length - 1];
   const rawTimestamp =
-    typeof sample.timeStamp === "number" && Number.isFinite(sample.timeStamp) ? sample.timeStamp : performance.now();
+    typeof sample.timeStamp === "number" && Number.isFinite(sample.timeStamp)
+      ? sample.timeStamp
+      : performance.now();
 
   // 直前と完全に同じ時刻・同じ角度の重複サンプルは追加しない
-  if (last && rawTimestamp === last.timestamp && angle === signDragState.lastAngle) return;
+  if (
+    last &&
+    rawTimestamp === last.timestamp &&
+    angle === signDragState.lastAngle
+  )
+    return;
 
   const delta = normalizeAngleDelta(angle - signDragState.lastAngle);
   signDragState.lastAngle = angle;
   signDragState.cumulativeDelta += delta;
-  currentSignRotation = signDragState.startRotation + signDragState.cumulativeDelta;
+  currentSignRotation =
+    signDragState.startRotation + signDragState.cumulativeDelta;
 
   // ノイズ以上の角度移動があれば、そのときの向きを「直前に観測された実際のドラッグ方向」として保持する。
   // releaseVelocityが低速・不正で信頼できない場合の方向決定フォールバックに使う。
@@ -874,7 +1142,8 @@ function recordSignPointerSample(sample) {
   // 0.1度未満の)複数サンプルへ分割することがあり、1サンプルごとの差分だけを見ていると
   // 「実際は明確に方向のある動きなのに、どのサンプル単体も閾値未満」となって方向を
   // 見失ってしまうため（低速・微小な反時計回り操作が既定方向へフォールバックしてしまうバグの原因）。
-  const deltaSinceDirectionCheckpoint = signDragState.cumulativeDelta - signDragState.directionRefDelta;
+  const deltaSinceDirectionCheckpoint =
+    signDragState.cumulativeDelta - signDragState.directionRefDelta;
   if (Math.abs(deltaSinceDirectionCheckpoint) >= MIN_DIRECTION_DELTA_DEG) {
     lastSignDragDirection = Math.sign(deltaSinceDirectionCheckpoint);
     signDragState.directionRefDelta = signDragState.cumulativeDelta;
@@ -882,12 +1151,15 @@ function recordSignPointerSample(sample) {
 
   // timeStampが逆行した場合は直前値へ丸め、同時刻区間は速度計算側のdt<=0判定で除外する。
   // 架空の微小時間を足すと、指を離す瞬間の小さな戻りが極端な角速度へ増幅されるため。
-  const timestamp = last ? Math.max(rawTimestamp, last.timestamp) : rawTimestamp;
+  const timestamp = last
+    ? Math.max(rawTimestamp, last.timestamp)
+    : rawTimestamp;
   history.push({ angle: currentSignRotation, timestamp });
 }
 
 function onSignPointerDown(e) {
-  if (activeSignPointerId !== null && activeSignPointerId !== e.pointerId) return; // 複数ポインター同時操作は無視
+  if (activeSignPointerId !== null && activeSignPointerId !== e.pointerId)
+    return; // 複数ポインター同時操作は無視
   cancelSignAnimation(); // 回転中でもその場で掴み直せるようにする
   pendingReleaseDebug = null; // 直前の回転が未完了のまま掴み直された場合、古い計測値を持ち越さない
   lastSignDragDirection = 0; // 新しい操作の開始時にリセットする（今回の操作で観測した方向だけを使うため）
@@ -939,7 +1211,8 @@ function computeReleaseVelocity(history) {
 }
 
 function hasEnoughVelocityData(samples) {
-  if (!samples || samples.length < SIGN_RELEASE_VELOCITY.minimumSampleCount) return false;
+  if (!samples || samples.length < SIGN_RELEASE_VELOCITY.minimumSampleCount)
+    return false;
   const span = samples[samples.length - 1].timestamp - samples[0].timestamp;
   return span >= SIGN_RELEASE_VELOCITY.minimumWindowMs;
 }
@@ -949,18 +1222,30 @@ function hasEnoughVelocityData(samples) {
 function selectVelocityWindow(history) {
   if (!history || history.length < 2) return history || [];
   const latestTime = history[history.length - 1].timestamp;
-  const preferred = history.filter((s) => latestTime - s.timestamp <= SIGN_RELEASE_VELOCITY.preferredWindowMs);
+  const preferred = history.filter(
+    (s) => latestTime - s.timestamp <= SIGN_RELEASE_VELOCITY.preferredWindowMs,
+  );
   if (hasEnoughVelocityData(preferred)) return preferred;
-  const fallback = history.filter((s) => latestTime - s.timestamp <= SIGN_RELEASE_VELOCITY.fallbackWindowMs);
+  const fallback = history.filter(
+    (s) => latestTime - s.timestamp <= SIGN_RELEASE_VELOCITY.fallbackWindowMs,
+  );
   if (hasEnoughVelocityData(fallback)) return fallback;
   return history;
 }
 
 // ウィンドウ内での時間的な位置(0=最古側,1=最新側)に応じて、直近の区間ほど重くなる重みを返す。
-function calculateRecencyWeight(segmentEndTime, windowStartTime, windowDuration) {
+function calculateRecencyWeight(
+  segmentEndTime,
+  windowStartTime,
+  windowDuration,
+) {
   if (windowDuration <= 0) return 1;
   const recency = clamp01((segmentEndTime - windowStartTime) / windowDuration);
-  return 1 + Math.pow(recency, SIGN_RELEASE_VELOCITY.recencyWeightPower) * SIGN_RELEASE_VELOCITY.recencyWeightMax;
+  return (
+    1 +
+    Math.pow(recency, SIGN_RELEASE_VELOCITY.recencyWeightPower) *
+      SIGN_RELEASE_VELOCITY.recencyWeightMax
+  );
 }
 
 // pointerup直前の角速度を、直近ウィンドウ内の区間ごとの加重平均(+任意でピーク速度とのブレンド)で算出する。
@@ -991,8 +1276,16 @@ function calculateReleaseAngularVelocity(fullHistory) {
     if (dt <= 0) continue; // 時間差ゼロ以下の区間は除外
     const deltaAngle = normalizeAngleDelta(cur.angle - prev.angle);
     const velocity = deltaAngle / dt;
-    if (!Number.isFinite(velocity) || Math.abs(velocity) > SIGN_RELEASE_VELOCITY.maxSegmentVelocity) continue; // 異常値除外
-    const weight = calculateRecencyWeight(cur.timestamp, windowStartTime, windowDuration);
+    if (
+      !Number.isFinite(velocity) ||
+      Math.abs(velocity) > SIGN_RELEASE_VELOCITY.maxSegmentVelocity
+    )
+      continue; // 異常値除外
+    const weight = calculateRecencyWeight(
+      cur.timestamp,
+      windowStartTime,
+      windowDuration,
+    );
     weightedSum += velocity * weight;
     totalWeight += weight;
     if (Math.abs(velocity) > Math.abs(peak)) peak = velocity;
@@ -1006,7 +1299,8 @@ function calculateReleaseAngularVelocity(fullHistory) {
 
   const weightedAverage = weightedSum / totalWeight;
   const blended = SIGN_RELEASE_VELOCITY.usePeakBlend
-    ? weightedAverage * RELEASE_VELOCITY_BLEND.weightedAverageRatio + peak * RELEASE_VELOCITY_BLEND.recentPeakRatio
+    ? weightedAverage * RELEASE_VELOCITY_BLEND.weightedAverageRatio +
+      peak * RELEASE_VELOCITY_BLEND.recentPeakRatio
     : weightedAverage;
 
   debug.selectedWindowMs = windowDuration;
@@ -1057,7 +1351,8 @@ function onSignPointerUp(e) {
   // resolveSpinDirection()に一本化する（低速でも実際のドラッグ方向があればそれを尊重する）。
   const isTap =
     movedAngle < SIGN_PHYSICS.tapMaxAngleDeg &&
-    (duration < SIGN_PHYSICS.tapMaxDurationMs || Math.abs(velocityDegPerMs) < SIGN_PHYSICS.minFlickVelocity);
+    (duration < SIGN_PHYSICS.tapMaxDurationMs ||
+      Math.abs(velocityDegPerMs) < SIGN_PHYSICS.minFlickVelocity);
   const resolvedSpinDirection = resolveSpinDirection(velocityDegPerMs);
 
   logSignDebug("release", {
@@ -1118,15 +1413,25 @@ function pickTapRotationPlan(startRotation, targetBearingDeg, spinSign) {
   const mid = (minDeg + maxDeg) / 2;
   const minVisibleDeg = 30; // これ未満の回転量は「動いた」と感じにくいため、可能な限り避ける
   const candidates = [0, 1].map((extra) => {
-    const finalRotation = computeFinalRotation(startRotation, targetBearingDeg, spinSign, extra);
+    const finalRotation = computeFinalRotation(
+      startRotation,
+      targetBearingDeg,
+      spinSign,
+      extra,
+    );
     const totalRotation = Math.abs(finalRotation - startRotation);
     return { spinSign, finalRotation, totalRotation };
   });
   const pickClosestToMid = (pool) => {
-    pool.sort((a, b) => Math.abs(a.totalRotation - mid) - Math.abs(b.totalRotation - mid));
+    pool.sort(
+      (a, b) =>
+        Math.abs(a.totalRotation - mid) - Math.abs(b.totalRotation - mid),
+    );
     return pool[0];
   };
-  const inRange = candidates.filter((c) => c.totalRotation >= minDeg && c.totalRotation <= maxDeg);
+  const inRange = candidates.filter(
+    (c) => c.totalRotation >= minDeg && c.totalRotation <= maxDeg,
+  );
   if (inRange.length > 0) return pickClosestToMid(inRange);
   // 目標方位が現在角度のごく近くにある等でレンジに収まらない場合は、
   // 見た目上ほぼ動かなくなる候補を避けつつ、レンジ中心に近いものへフォールバックする。
@@ -1166,16 +1471,24 @@ function startTapSpin(releaseVelocity) {
     return;
   }
 
-  const duration = randRange(SIGN_PHYSICS.tapSpinDurationRangeMs[0], SIGN_PHYSICS.tapSpinDurationRangeMs[1]);
+  const duration = randRange(
+    SIGN_PHYSICS.tapSpinDurationRangeMs[0],
+    SIGN_PHYSICS.tapSpinDurationRangeMs[1],
+  );
   logSignDebug("tap-spin", { targetSector, spinSign, plan, duration });
-  tweenRotation(startRotation, plan.finalRotation, duration, () => finishSpin(targetSector));
+  tweenRotation(startRotation, plan.finalRotation, duration, () =>
+    finishSpin(targetSector),
+  );
 }
 
 function startButtonSpin() {
   if (signDragState) return; // ドラッグ中はボタン操作を無視する
   cancelSignAnimation();
   const spinSign = Math.random() < 0.5 ? -1 : 1;
-  logSignDebug("button-spin", { spinSign, inputVelocity: SIGN_PHYSICS.buttonSpinVelocity });
+  logSignDebug("button-spin", {
+    spinSign,
+    inputVelocity: SIGN_PHYSICS.buttonSpinVelocity,
+  });
   startFlickSpin(SIGN_PHYSICS.buttonSpinVelocity, spinSign); // 中程度のフリック相当の疑似入力を使う
 }
 
@@ -1192,20 +1505,31 @@ function startFlickSpin(inputVelocityDegPerMs, spinSign) {
   cancelSignAnimation();
   const clamped = Math.min(
     SIGN_PHYSICS.maxInputVelocity,
-    Math.max(SIGN_PHYSICS.minFlickVelocity, Math.abs(inputVelocityDegPerMs))
+    Math.max(SIGN_PHYSICS.minFlickVelocity, Math.abs(inputVelocityDegPerMs)),
   );
   const normalized = clamp01(
-    (clamped - SIGN_PHYSICS.minFlickVelocity) / (SIGN_PHYSICS.maxInputVelocity - SIGN_PHYSICS.minFlickVelocity)
+    (clamped - SIGN_PHYSICS.minFlickVelocity) /
+      (SIGN_PHYSICS.maxInputVelocity - SIGN_PHYSICS.minFlickVelocity),
   );
   const curved = Math.pow(normalized, SIGN_PHYSICS.velocityCurvePower);
   const spinVelocity =
-    SIGN_PHYSICS.minSpinVelocity + curved * (SIGN_PHYSICS.maxSpinVelocity - SIGN_PHYSICS.minSpinVelocity);
+    SIGN_PHYSICS.minSpinVelocity +
+    curved * (SIGN_PHYSICS.maxSpinVelocity - SIGN_PHYSICS.minSpinVelocity);
   // 摩擦も入力強度で補間する（弱い入力ほど速く止まり、強い入力ほど長く/多く回る）。
   const friction =
     SIGN_PHYSICS.frictionPerFrameAt60fpsMin +
-    curved * (SIGN_PHYSICS.frictionPerFrameAt60fpsMax - SIGN_PHYSICS.frictionPerFrameAt60fpsMin);
+    curved *
+      (SIGN_PHYSICS.frictionPerFrameAt60fpsMax -
+        SIGN_PHYSICS.frictionPerFrameAt60fpsMin);
 
-  logSignDebug("flick-spin-start", { inputVelocityDegPerMs, spinSign, normalized, curved, spinVelocity, friction });
+  logSignDebug("flick-spin-start", {
+    inputVelocityDegPerMs,
+    spinSign,
+    normalized,
+    curved,
+    spinVelocity,
+    friction,
+  });
   if (pendingReleaseDebug) {
     pendingReleaseDebug.rawReleaseVelocity = inputVelocityDegPerMs;
     pendingReleaseDebug.clampedVelocity = clamped;
@@ -1235,12 +1559,28 @@ function runInertiaSpin(signedVelocityDegPerMs, frictionPerFrameAt60fps) {
   function step(now) {
     // 安全装置: 万一ここまでにNaN/Infinityが混入していたら、暴走させず現在角度から即座に吸着させる。
     if (!Number.isFinite(velocity) || !Number.isFinite(currentSignRotation)) {
-      currentSignRotation = Number.isFinite(currentSignRotation) ? currentSignRotation : 0;
+      currentSignRotation = Number.isFinite(currentSignRotation)
+        ? currentSignRotation
+        : 0;
       const dirSign = signedVelocityDegPerMs >= 0 ? 1 : -1;
       const frontier = getFrontierForSign();
-      const { targetSector } = pickFlickLandingSector(currentSignRotation, dirSign, frontier);
-      const finalRotation = computeFinalRotation(currentSignRotation, targetSector * 45, dirSign, 0);
-      beginOvershootSettle(currentSignRotation, finalRotation, targetSector, dirSign);
+      const { targetSector } = pickFlickLandingSector(
+        currentSignRotation,
+        dirSign,
+        frontier,
+      );
+      const finalRotation = computeFinalRotation(
+        currentSignRotation,
+        targetSector * 45,
+        dirSign,
+        0,
+      );
+      beginOvershootSettle(
+        currentSignRotation,
+        finalRotation,
+        targetSector,
+        dirSign,
+      );
       return;
     }
 
@@ -1255,13 +1595,28 @@ function runInertiaSpin(signedVelocityDegPerMs, frictionPerFrameAt60fps) {
     velocity *= frictionFactor;
 
     const speed = Math.abs(velocity);
-    const overMaxDuration = now - inertiaStartTime >= SIGN_PHYSICS.maxSpinDurationMs;
+    const overMaxDuration =
+      now - inertiaStartTime >= SIGN_PHYSICS.maxSpinDurationMs;
 
     if (speed <= SIGN_PHYSICS.snapVelocityThreshold || overMaxDuration) {
-      const dirSign = velocity !== 0 ? Math.sign(velocity) : signedVelocityDegPerMs >= 0 ? 1 : -1;
+      const dirSign =
+        velocity !== 0
+          ? Math.sign(velocity)
+          : signedVelocityDegPerMs >= 0
+            ? 1
+            : -1;
       const frontier = getFrontierForSign();
-      const { natural, targetSector } = pickFlickLandingSector(currentSignRotation, dirSign, frontier);
-      const finalRotation = computeFinalRotation(currentSignRotation, targetSector * 45, dirSign, 0);
+      const { natural, targetSector } = pickFlickLandingSector(
+        currentSignRotation,
+        dirSign,
+        frontier,
+      );
+      const finalRotation = computeFinalRotation(
+        currentSignRotation,
+        targetSector * 45,
+        dirSign,
+        0,
+      );
       logSignDebug("inertia-end", {
         elapsedMs: now - inertiaStartTime,
         natural,
@@ -1271,12 +1626,18 @@ function runInertiaSpin(signedVelocityDegPerMs, frictionPerFrameAt60fps) {
       });
       if (pendingReleaseDebug) {
         pendingReleaseDebug.spinDurationMs = now - inertiaStartTime;
-        pendingReleaseDebug.estimatedRotations = Math.abs(currentSignRotation - spinStartRotationForDebug) / 360;
+        pendingReleaseDebug.estimatedRotations =
+          Math.abs(currentSignRotation - spinStartRotationForDebug) / 360;
         pendingReleaseDebug.snapDirection = dirSign;
         pendingReleaseDebug.targetAngle = finalRotation;
         logSignReleaseVelocityDebug();
       }
-      beginOvershootSettle(currentSignRotation, finalRotation, targetSector, dirSign);
+      beginOvershootSettle(
+        currentSignRotation,
+        finalRotation,
+        targetSector,
+        dirSign,
+      );
       return;
     }
 
@@ -1289,17 +1650,34 @@ function runInertiaSpin(signedVelocityDegPerMs, frictionPerFrameAt60fps) {
 function finishReducedMotionSpin(signedVelocityDegPerMs) {
   const dirSign = signedVelocityDegPerMs >= 0 ? 1 : -1;
   const frontier = getFrontierForSign();
-  const { targetSector } = pickFlickLandingSector(currentSignRotation, dirSign, frontier);
+  const { targetSector } = pickFlickLandingSector(
+    currentSignRotation,
+    dirSign,
+    frontier,
+  );
   // 強さに応じて最大1回転程度まで、短いトランジションで確定する（オーバーシュート・高速回転は行わない）。
-  const strength = clamp01(Math.abs(signedVelocityDegPerMs) / SIGN_PHYSICS.maxSpinVelocity);
+  const strength = clamp01(
+    Math.abs(signedVelocityDegPerMs) / SIGN_PHYSICS.maxSpinVelocity,
+  );
   const rotations = strength > 0.5 ? 1 : 0;
-  const finalRotation = computeFinalRotation(currentSignRotation, targetSector * 45, dirSign, rotations);
+  const finalRotation = computeFinalRotation(
+    currentSignRotation,
+    targetSector * 45,
+    dirSign,
+    rotations,
+  );
   currentSignRotation = finalRotation;
   applySignRotation(currentSignRotation); // reduced-motion用CSSトランジションで短く遷移する
-  logSignDebug("reduced-motion-spin", { dirSign, targetSector, finalRotation, strength });
+  logSignDebug("reduced-motion-spin", {
+    dirSign,
+    targetSector,
+    finalRotation,
+    strength,
+  });
   if (pendingReleaseDebug) {
     pendingReleaseDebug.spinDurationMs = 240;
-    pendingReleaseDebug.estimatedRotations = Math.abs(currentSignRotation - spinStartRotationForDebug) / 360;
+    pendingReleaseDebug.estimatedRotations =
+      Math.abs(currentSignRotation - spinStartRotationForDebug) / 360;
     logSignReleaseVelocityDebug();
   }
   setTimeout(() => finishSpin(targetSector), 240);
@@ -1307,13 +1685,28 @@ function finishReducedMotionSpin(signedVelocityDegPerMs) {
 
 // 慣性減速の終着点(finalRotation)へ向けて、現在の回転方向を保ったまま
 // 数度だけオーバーシュート→小さく戻る、の2段階で自然に吸着させる。
-function beginOvershootSettle(fromRotation, finalRotation, targetSector, dirSign) {
+function beginOvershootSettle(
+  fromRotation,
+  finalRotation,
+  targetSector,
+  dirSign,
+) {
   const overshootRotation = finalRotation + dirSign * SIGN_PHYSICS.overshootDeg;
-  tweenRotation(fromRotation, overshootRotation, SIGN_PHYSICS.overshootDurationMs, () => {
-    tweenRotation(overshootRotation, finalRotation, SIGN_PHYSICS.settleBackDurationMs, () => {
-      finishSpin(targetSector);
-    });
-  });
+  tweenRotation(
+    fromRotation,
+    overshootRotation,
+    SIGN_PHYSICS.overshootDurationMs,
+    () => {
+      tweenRotation(
+        overshootRotation,
+        finalRotation,
+        SIGN_PHYSICS.settleBackDurationMs,
+        () => {
+          finishSpin(targetSector);
+        },
+      );
+    },
+  );
 }
 
 // from→toへ、指定ミリ秒かけてease-outで単純に遷移する汎用トゥイーン。
@@ -1346,12 +1739,14 @@ function onSignSettled(sector) {
   const label = COMPASS_LABELS[sector];
   adventureState.direction = { sector, label, bearingDeg: sector * 45 };
   el("direction-result-text").textContent = `今日は${label}へ。`;
-  el("direction-result-sub").textContent = "最初の200〜300mだけ、この方向を意識してみよう。";
+  el("direction-result-sub").textContent =
+    "最初の200〜300mだけ、この方向を意識してみよう。";
   el("direction-result").classList.remove("hidden");
   // #sign-boardはaria-hiddenな視覚要素なので、読み上げ用にsr-onlyのライブリージョンへ結果を通知する。
   el("sign-sr-status").textContent = `方角が決まりました。今日は${label}へ。`;
   const confirmBtn = el("btn-confirm-direction");
   if (confirmBtn) confirmBtn.focus();
+  selectAndShowTargetCell(); // 方角確定直後、その方向の最初の未踏セルを1つだけ淡く光らせる
 }
 
 function showDirectionPanel() {
@@ -1360,19 +1755,23 @@ function showDirectionPanel() {
   el("direction-hint").textContent = isNightTime()
     ? "明るく、人通りのある道を選んでください。標識をはじいて方角を決めよう。"
     : "標識をはじいて、今日進む方角を決めよう。";
-  el("sign-sr-status").textContent = "まだ方角は決まっていません。標識を回すボタンで方角を決められます。";
+  el("sign-sr-status").textContent =
+    "まだ方角は決まっていません。標識を回すボタンで方角を決められます。";
   // パネルを開くたびに標識の操作状態を安全にリセットする
   cancelSignAnimation();
   activeSignPointerId = null;
   signDragState = null;
+  clearTargetCell(); // 新しい方向決定フローに入るタイミングで、前回分の発光が残っていれば片付ける
 }
 
 function redoDirection() {
   el("direction-result").classList.add("hidden");
   adventureState.direction = null;
-  el("sign-sr-status").textContent = "方角をやり直します。もう一度、標識を回すボタンを押してください。";
+  el("sign-sr-status").textContent =
+    "方角をやり直します。もう一度、標識を回すボタンを押してください。";
   const spinBtn = el("btn-spin-sign");
   if (spinBtn) spinBtn.focus();
+  clearTargetCell(); // 方向をやり直す時点で、以前の対象セルの発光を解除する（新しい発光はonSignSettledで選び直す）
 }
 
 function confirmDirection() {
@@ -1390,6 +1789,26 @@ function confirmDirection() {
 /* ---------- セル発見リアクション ----------
    将来SEを追加しやすいよう、視覚・文言・振動のリアクションを一箇所にまとめる。 */
 function handleCellDiscoveryFeedback(ix, iy) {
+  // 発光対象セルへの到達判定。targetCellRevealStartedで同一セルの多重演出を防ぐ。
+  const isTargetCell = !!(
+    activeTargetCell &&
+    activeTargetCell.ix === ix &&
+    activeTargetCell.iy === iy &&
+    !targetCellRevealStarted
+  );
+  if (isTargetCell) targetCellRevealStarted = true;
+
+  revealFogCell(ix, iy); // 発光対象以外の未踏セルでも、同じ「霧が晴れる」演出を行う
+  if (isTargetCell) {
+    flashTargetGlow();
+    setTimeout(clearTargetCell, CELL_FOG_CONFIG.revealDurationMs); // 霧が晴れ切る頃に発光レイヤーごと片付ける
+  }
+  logCellFogDebug("cell-discovered", {
+    currentCellId: cellKey(ix, iy),
+    reachedTargetCell: isTargetCell,
+    revealStarted: true,
+  });
+
   drawVisitedCell(ix, iy, { animate: true });
   showToast("新しい場所を発見！");
   pushLog("cell", `セル開放 (${ix},${iy})`);
@@ -1403,13 +1822,16 @@ function handleCellDiscoveryFeedback(ix, iy) {
   if (adventureState.status === "active") {
     adventureState.discoveredCells++;
     const alreadyTracked = adventureState.sessionDiscoveredCellIds.some(
-      (c) => c.ix === ix && c.iy === iy
+      (c) => c.ix === ix && c.iy === iy,
     );
     if (!alreadyTracked) {
       adventureState.sessionDiscoveredCellIds.push({ ix, iy });
     }
     renderAdventureHud();
-    if (!adventureState.targetReached && adventureState.discoveredCells >= adventureState.targetCells) {
+    if (
+      !adventureState.targetReached &&
+      adventureState.discoveredCells >= adventureState.targetCells
+    ) {
       adventureState.targetReached = true;
       setTimeout(() => showToast("今日の冒険を達成しました！"), 900);
     }
@@ -1421,7 +1843,9 @@ function checkMilestones() {
   try {
     const total = Object.keys(visited).length;
     const displayed = store.get(STORAGE_KEYS.milestones, []);
-    const newlyReached = MILESTONE_THRESHOLDS.filter((t) => total >= t && !displayed.includes(t));
+    const newlyReached = MILESTONE_THRESHOLDS.filter(
+      (t) => total >= t && !displayed.includes(t),
+    );
     if (newlyReached.length === 0) return;
     const toCelebrate = newlyReached[newlyReached.length - 1];
     store.set(STORAGE_KEYS.milestones, [...displayed, ...newlyReached]);
@@ -1465,12 +1889,18 @@ function spawnConfetti() {
 let lastCompletionMessage = ""; // 成果カードでも同じ一行メッセージを使い回すため保持
 
 function showCompletionSheet() {
-  const preset = adventureState.preset ? ADVENTURE_PRESETS[adventureState.preset] : null;
+  const preset = adventureState.preset
+    ? ADVENTURE_PRESETS[adventureState.preset]
+    : null;
   el("completion-duration").textContent = preset ? `${preset.minutes}分` : "--";
-  el("completion-direction").textContent = adventureState.direction ? adventureState.direction.label : "--";
-  el("completion-session-cells").textContent = `${adventureState.discoveredCells}`;
+  el("completion-direction").textContent = adventureState.direction
+    ? adventureState.direction.label
+    : "--";
+  el("completion-session-cells").textContent =
+    `${adventureState.discoveredCells}`;
   el("completion-total-cells").textContent = `${Object.keys(visited).length}`;
-  lastCompletionMessage = COMPLETION_MESSAGES[Math.floor(Math.random() * COMPLETION_MESSAGES.length)];
+  lastCompletionMessage =
+    COMPLETION_MESSAGES[Math.floor(Math.random() * COMPLETION_MESSAGES.length)];
   el("completion-message").textContent = lastCompletionMessage;
   const firstBtn = el("completion-sheet").querySelector("button");
   if (firstBtn) firstBtn.focus();
@@ -1526,9 +1956,11 @@ let shareCardReturnFocusEl = null;
 
 function getFocusableElements(container) {
   const nodes = container.querySelectorAll(
-    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
   );
-  return Array.from(nodes).filter((n) => !n.disabled && n.offsetParent !== null);
+  return Array.from(nodes).filter(
+    (n) => !n.disabled && n.offsetParent !== null,
+  );
 }
 
 function getOpenModalContainer() {
@@ -1556,7 +1988,10 @@ function handleGlobalModalKeydown(e) {
       e.preventDefault();
       first.focus();
     }
-  } else if (e.key === "Escape" && (container.id === "direction-card" || container.id === "achievement-card")) {
+  } else if (
+    e.key === "Escape" &&
+    (container.id === "direction-card" || container.id === "achievement-card")
+  ) {
     e.preventDefault();
     closeShareCard(container.id);
   }
@@ -1581,7 +2016,10 @@ function closeShareCard(cardId) {
     const bgEl = document.getElementById(id);
     if (bgEl) bgEl.removeAttribute("aria-hidden");
   });
-  if (shareCardReturnFocusEl && typeof shareCardReturnFocusEl.focus === "function") {
+  if (
+    shareCardReturnFocusEl &&
+    typeof shareCardReturnFocusEl.focus === "function"
+  ) {
     try {
       shareCardReturnFocusEl.focus();
     } catch (e) {
@@ -1594,8 +2032,10 @@ function closeShareCard(cardId) {
 /* ---------- Priority 1: 方向決定カード ---------- */
 function showDirectionCard() {
   if (!adventureState.direction) return;
-  el("share-sign-board").style.transform = `rotate(${adventureState.direction.bearingDeg}deg)`;
-  el("direction-card-text").textContent = `今日は${adventureState.direction.label}へ。`;
+  el("share-sign-board").style.transform =
+    `rotate(${adventureState.direction.bearingDeg}deg)`;
+  el("direction-card-text").textContent =
+    `今日は${adventureState.direction.label}へ。`;
   openShareCard("direction-card");
 }
 
@@ -1633,7 +2073,10 @@ function renderShapeGrid(container, cellIds) {
   const height = Math.max(...cells.map((c) => c.y)) + 1;
   const cellPx = Math.max(
     SHAPE_GRID_MIN_CELL_PX,
-    Math.min(SHAPE_GRID_MAX_CELL_PX, Math.floor(SHAPE_GRID_MAX_PX / Math.max(width, height)))
+    Math.min(
+      SHAPE_GRID_MAX_CELL_PX,
+      Math.floor(SHAPE_GRID_MAX_PX / Math.max(width, height)),
+    ),
   );
   container.style.gridTemplateColumns = `repeat(${width}, ${cellPx}px)`;
   container.style.gridTemplateRows = `repeat(${height}, ${cellPx}px)`;
@@ -1649,10 +2092,17 @@ function renderShapeGrid(container, cellIds) {
 
 /* ---------- Priority 2 + 4: 冒険成果カード ---------- */
 function showAchievementCard() {
-  el("achievement-cell-count").textContent = `${adventureState.sessionDiscoveredCellIds.length}`;
-  const preset = adventureState.preset ? ADVENTURE_PRESETS[adventureState.preset] : null;
-  el("achievement-duration").textContent = preset ? `${preset.minutes}分` : "--";
-  el("achievement-direction").textContent = adventureState.direction ? adventureState.direction.label : "--";
+  el("achievement-cell-count").textContent =
+    `${adventureState.sessionDiscoveredCellIds.length}`;
+  const preset = adventureState.preset
+    ? ADVENTURE_PRESETS[adventureState.preset]
+    : null;
+  el("achievement-duration").textContent = preset
+    ? `${preset.minutes}分`
+    : "--";
+  el("achievement-direction").textContent = adventureState.direction
+    ? adventureState.direction.label
+    : "--";
   el("achievement-message").textContent = lastCompletionMessage;
 
   const notice = el("share-privacy-notice");
@@ -1667,7 +2117,10 @@ function showAchievementCard() {
   }
 
   try {
-    renderShapeGrid(el("achievement-shape-grid"), adventureState.sessionDiscoveredCellIds);
+    renderShapeGrid(
+      el("achievement-shape-grid"),
+      adventureState.sessionDiscoveredCellIds,
+    );
   } catch (e) {
     // シルエット描画に失敗してもカード自体は表示する
   }
@@ -1730,13 +2183,16 @@ function handlePosition(pos) {
     }
 
     if (quest && quest.ix === ix && quest.iy === iy) {
-      const g = quest.gradientPct != null ? `勾配目安${quest.gradientPct}%` : "";
+      const g =
+        quest.gradientPct != null ? `勾配目安${quest.gradientPct}%` : "";
       showToast(`クエスト達成！${g}`);
       pushLog("quest", `勾配クエスト達成 ${g}`);
       quest = null;
       store.set(STORAGE_KEYS.quest, null);
       questLayer.clearLayers();
     }
+
+    updateFogCells(lat, lon); // 精度の粗い測位では霧の中心もずらさない（GPSノイズでの誤表示を避ける）
   }
 
   updateHud(lat, lon);
@@ -1756,11 +2212,15 @@ function handlePositionError(err) {
       geoRetried = true;
       showToast("位置情報の取得に時間がかかっています。再試行します…");
       showLoading();
-      navigator.geolocation.getCurrentPosition(handlePosition, handlePositionError, {
-        enableHighAccuracy: false,
-        timeout: 20000,
-        maximumAge: 60000,
-      });
+      navigator.geolocation.getCurrentPosition(
+        handlePosition,
+        handlePositionError,
+        {
+          enableHighAccuracy: false,
+          timeout: 20000,
+          maximumAge: 60000,
+        },
+      );
       return;
     }
     // 再試行しても失敗、または権限拒否などの場合は開始画面に戻して再操作できるようにする。
@@ -1787,7 +2247,9 @@ function showRetryScreen(err) {
     3: "現在地の取得がタイムアウトしました。もう一度お試しください。", // TIMEOUT
   };
   const errorEl = el("permission-error");
-  errorEl.textContent = messages[err.code] || "現在地を取得できませんでした。もう一度お試しください。";
+  errorEl.textContent =
+    messages[err.code] ||
+    "現在地を取得できませんでした。もう一度お試しください。";
   errorEl.classList.remove("hidden");
   geoRetried = false;
   el("permission-screen").classList.remove("hidden");
@@ -1801,10 +2263,14 @@ function startTracking() {
     return;
   }
   showLoading();
-  navigator.geolocation.getCurrentPosition(handlePosition, handlePositionError, {
-    enableHighAccuracy: true,
-    timeout: 15000,
-  });
+  navigator.geolocation.getCurrentPosition(
+    handlePosition,
+    handlePositionError,
+    {
+      enableHighAccuracy: true,
+      timeout: 15000,
+    },
+  );
   navigator.geolocation.watchPosition(handlePosition, handlePositionError, {
     enableHighAccuracy: true,
     maximumAge: 5000,
@@ -1817,9 +2283,15 @@ window.addEventListener("DOMContentLoaded", () => {
   renderLog();
 
   el("btn-start").addEventListener("click", startTracking);
-  el("btn-log").addEventListener("click", () => el("log-panel").classList.remove("hidden"));
-  el("btn-close-log").addEventListener("click", () => el("log-panel").classList.add("hidden"));
-  el("btn-close-quest").addEventListener("click", () => el("quest-panel").classList.add("hidden"));
+  el("btn-log").addEventListener("click", () =>
+    el("log-panel").classList.remove("hidden"),
+  );
+  el("btn-close-log").addEventListener("click", () =>
+    el("log-panel").classList.add("hidden"),
+  );
+  el("btn-close-quest").addEventListener("click", () =>
+    el("quest-panel").classList.add("hidden"),
+  );
 
   // フロンティア・コンパス: 縮小時は本体タップで再展開、×は閉じるボタンのみで反応
   el("frontier-compass").addEventListener("click", () => {
@@ -1836,7 +2308,9 @@ window.addEventListener("DOMContentLoaded", () => {
 
   // ---- 冒険時間選択 ----
   document.querySelectorAll(".duration-option").forEach((btn) => {
-    btn.addEventListener("click", () => selectAdventurePreset(btn.dataset.preset));
+    btn.addEventListener("click", () =>
+      selectAdventurePreset(btn.dataset.preset),
+    );
   });
 
   // ---- 道路標識（方向決定） ----
@@ -1870,9 +2344,16 @@ window.addEventListener("DOMContentLoaded", () => {
 
   // ---- 共有カード ----
   el("btn-show-direction-card").addEventListener("click", showDirectionCard);
-  el("btn-close-direction-card").addEventListener("click", () => closeShareCard("direction-card"));
-  el("btn-show-achievement-card").addEventListener("click", showAchievementCard);
-  el("btn-close-achievement-card").addEventListener("click", () => closeShareCard("achievement-card"));
+  el("btn-close-direction-card").addEventListener("click", () =>
+    closeShareCard("direction-card"),
+  );
+  el("btn-show-achievement-card").addEventListener(
+    "click",
+    showAchievementCard,
+  );
+  el("btn-close-achievement-card").addEventListener("click", () =>
+    closeShareCard("achievement-card"),
+  );
   el("btn-privacy-ack").addEventListener("click", () => {
     el("share-privacy-notice").classList.add("hidden");
   });

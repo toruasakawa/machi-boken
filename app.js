@@ -28,8 +28,15 @@ const CELL_FOG_CONFIG = {
   strokeOpacity: 0.25,
   strokeWeight: 1,
   revealDurationMs: 700, // 霧が晴れる演出の所要時間（styles.cssの.map-cell-fogの transition と合わせること）
-  targetPulseDurationMs: 2200, // 対象セル発光の呼吸周期の目安（styles.cssのtarget-cell-breatheと合わせること）
+  targetPulseDurationMs: 2200, // SVGへCSS変数として渡し、styles.cssの呼吸周期を一元管理する
   targetMaxSteps: 4, // 確定方角に沿って最初の未踏セルを探す最大セル数（無限探索を避ける）
+  // 80%不透明の白い霧の上でも輪郭が消えないよう、塗りは薄く保ちつつ輪郭だけ濃くする。
+  targetStrokeColor: "#0f766e",
+  targetStrokeOpacity: 0.75,
+  targetStrokeWeight: 3,
+  targetFillColor: "#5eead4",
+  targetFillOpacity: 0.1,
+  targetViewportPaddingPx: { top: 96, right: 40, bottom: 120, left: 40 }, // HUDや下部UIに発光中心が隠れない余白
   maxRenderedFogCells: 100, // 霧レイヤーの上限。モバイルでのDOM/SVG要素数を保護する
 };
 const DEBUG_CELL_FOG = false; // trueにすると霧・対象セルの計測値をコンソールへ出力する（本番はfalse）
@@ -242,12 +249,16 @@ function initMap(lat, lon) {
   const targetGlowPane = map.createPane("targetGlowPane");
   targetGlowPane.style.zIndex = 410; // overlayPane(400)の上＝訪問済み色より前面に発光を出す
   targetGlowPane.style.pointerEvents = "none";
+  const currentLocationPane = map.createPane("currentLocationPane");
+  currentLocationPane.style.zIndex = 450; // 発光より上、クエスト旗(markerPane=600)より下に現在地を保つ
+  currentLocationPane.style.pointerEvents = "none";
 
   fogLayer = L.layerGroup().addTo(map);
   cellsLayer = L.layerGroup().addTo(map);
   questLayer = L.layerGroup().addTo(map);
 
   meMarker = L.circleMarker([lat, lon], {
+    pane: "currentLocationPane",
     radius: 7,
     color: "#f59e0b",
     fillColor: "#f59e0b",
@@ -415,21 +426,88 @@ function findFirstUnvisitedCellAlongDirection(cix, ciy, sector, maxSteps) {
   return null; // 見つからなくても呼び出し側は発光なしで冒険を継続できる
 }
 
+function keepTargetCellInView(targetLayer) {
+  if (!map || !targetLayer) return;
+  const padding = CELL_FOG_CONFIG.targetViewportPaddingPx;
+  try {
+    // 方向パネルやHUDに隠れない範囲へ、ズームを変えず必要な分だけ地図を動かす。
+    map.panInside(targetLayer.getBounds().getCenter(), {
+      paddingTopLeft: L.point(padding.left, padding.top),
+      paddingBottomRight: L.point(padding.right, padding.bottom),
+      animate: !prefersReducedMotion(),
+    });
+  } catch (e) {
+    // 表示補正に失敗しても、発光レイヤーと冒険本体は維持する。
+    logCellFogDebug("target-pan-failed", { message: String(e) });
+  }
+}
+
+function logTargetGlowState(event, extra) {
+  if (!DEBUG_CELL_FOG) return;
+  const layer = activeTargetGlowLayer;
+  const element = layer && layer.getElement ? layer.getElement() : null;
+  const style = element ? getComputedStyle(element) : null;
+  const pane = layer && layer.getPane ? layer.getPane() : null;
+  logCellFogDebug(event, {
+    targetLayerExists: !!layer,
+    targetLayerOnMap: !!(layer && map && map.hasLayer(layer)),
+    targetElementExists: !!element,
+    targetElementClassList: element ? Array.from(element.classList) : [],
+    targetPaneName: layer ? layer.options.pane : null,
+    targetPaneZIndex: pane ? getComputedStyle(pane).zIndex : null,
+    computedAnimationName: style ? style.animationName : null,
+    computedAnimationDuration: style ? style.animationDuration : null,
+    computedOpacity: style ? style.opacity : null,
+    computedFillOpacity: style ? style.fillOpacity : null,
+    computedStrokeOpacity: style ? style.strokeOpacity : null,
+    ...extra,
+  });
+}
+
 function drawTargetCellGlow(ix, iy) {
-  if (!map) return;
+  if (!map) return null;
   activeTargetGlowLayer = L.rectangle(cellBoundsLatLon(ix, iy), {
     pane: "targetGlowPane",
     interactive: false,
     className: "target-cell-glow",
-    color: "#bff3e6", // 白〜淡い青緑系。クエスト旗や視認済み色（amber）と混同しないようにする
-    weight: 2,
-    fillColor: "#eafaf5",
+    color: CELL_FOG_CONFIG.targetStrokeColor,
+    opacity: CELL_FOG_CONFIG.targetStrokeOpacity,
+    weight: CELL_FOG_CONFIG.targetStrokeWeight,
+    fillColor: CELL_FOG_CONFIG.targetFillColor,
+    fillOpacity: CELL_FOG_CONFIG.targetFillOpacity,
   }).addTo(map);
+  keepTargetCellInView(activeTargetGlowLayer);
+
+  if (DEBUG_CELL_FOG) {
+    requestAnimationFrame(() => {
+      const element = activeTargetGlowLayer
+        ? activeTargetGlowLayer.getElement()
+        : null;
+      if (element) {
+        element.style.setProperty(
+          "--target-pulse-duration",
+          `${CELL_FOG_CONFIG.targetPulseDurationMs}ms`,
+        );
+      }
+      logTargetGlowState("target-glow-applied", {
+        targetCellId: cellKey(ix, iy),
+      });
+    });
+  } else {
+    const element = activeTargetGlowLayer.getElement();
+    if (element) {
+      element.style.setProperty(
+        "--target-pulse-duration",
+        `${CELL_FOG_CONFIG.targetPulseDurationMs}ms`,
+      );
+    }
+  }
+  return activeTargetGlowLayer;
 }
 
-// 標識で方角が確定するたび（やり直し含む）呼ばれ、その方向の最初の未踏セルを1つだけ発光させる。
+// 冒険開始時に呼ばれ、確定方向の最初の未踏セルを1つだけ発光させる。
 function selectAndShowTargetCell() {
-  clearTargetCell(); // 前回の対象を必ず解除してから選び直す（方向再決定時の重複防止）
+  clearTargetCell("target-reselected"); // 前回の対象を必ず解除してから選び直す（方向再決定時の重複防止）
   if (!CELL_FOG_CONFIG.enabled || !adventureState.direction || !lastKnownLatLon)
     return;
 
@@ -459,7 +537,7 @@ function selectAndShowTargetCell() {
 // 対象セルの発光を一度だけ強くしてから、clearTargetCell()側のタイマーで片付ける合図を出す。
 function flashTargetGlow() {
   if (!activeTargetGlowLayer) return;
-  const path = activeTargetGlowLayer._path;
+  const path = activeTargetGlowLayer.getElement();
   if (path && !prefersReducedMotion()) {
     path.classList.add("is-flashing");
   }
@@ -467,13 +545,22 @@ function flashTargetGlow() {
 
 // 発光解除。冒険終了・中断・方向再決定・状態リセットなど、既存のリセット経路から呼ばれる。
 // 霧そのもの(fogLayer)は消さない——地図表示中は維持してよい仕様のため。
-function clearTargetCell() {
+function clearTargetCell(reason) {
+  const previousTargetCellId = activeTargetCell
+    ? cellKey(activeTargetCell.ix, activeTargetCell.iy)
+    : null;
   if (activeTargetGlowLayer && map) {
     map.removeLayer(activeTargetGlowLayer);
   }
   activeTargetGlowLayer = null;
   activeTargetCell = null;
   targetCellRevealStarted = false;
+  if (previousTargetCellId) {
+    logCellFogDebug("target-glow-cleared", {
+      reason: reason || "unspecified",
+      previousTargetCellId,
+    });
+  }
 }
 
 /* ---------- HUD / パネル操作 ---------- */
@@ -845,7 +932,7 @@ function resetAdventureStateKeepHistory() {
   adventureState.startLatLon = null;
   adventureState.targetReached = false;
   adventureState.sessionDiscoveredCellIds = [];
-  clearTargetCell(); // 冒険の再開始・終了時は対象セルの発光を必ず解除する（霧そのものは維持してよい）
+  clearTargetCell("adventure-reset"); // 冒険の再開始・終了時は対象セルの発光を必ず解除する（霧そのものは維持してよい）
 }
 
 function renderAdventureHud() {
@@ -870,7 +957,7 @@ function beginAdventureFlow() {
 
 function endAdventure() {
   if (adventureState.status !== "active") return;
-  clearTargetCell(); // 冒険終了時は対象セルの発光を解除する
+  clearTargetCell("adventure-ended"); // 冒険終了時は対象セルの発光を解除する
   setAdventureStatus("completed");
   showCompletionSheet();
 }
@@ -1746,7 +1833,6 @@ function onSignSettled(sector) {
   el("sign-sr-status").textContent = `方角が決まりました。今日は${label}へ。`;
   const confirmBtn = el("btn-confirm-direction");
   if (confirmBtn) confirmBtn.focus();
-  selectAndShowTargetCell(); // 方角確定直後、その方向の最初の未踏セルを1つだけ淡く光らせる
 }
 
 function showDirectionPanel() {
@@ -1761,7 +1847,7 @@ function showDirectionPanel() {
   cancelSignAnimation();
   activeSignPointerId = null;
   signDragState = null;
-  clearTargetCell(); // 新しい方向決定フローに入るタイミングで、前回分の発光が残っていれば片付ける
+  clearTargetCell("direction-flow-opened"); // 新しい方向決定フローに入るタイミングで、前回分の発光が残っていれば片付ける
 }
 
 function redoDirection() {
@@ -1771,7 +1857,7 @@ function redoDirection() {
     "方角をやり直します。もう一度、標識を回すボタンを押してください。";
   const spinBtn = el("btn-spin-sign");
   if (spinBtn) spinBtn.focus();
-  clearTargetCell(); // 方向をやり直す時点で、以前の対象セルの発光を解除する（新しい発光はonSignSettledで選び直す）
+  clearTargetCell("direction-redone"); // 方向をやり直す時点で、以前の対象セルの発光を解除する
 }
 
 function confirmDirection() {
@@ -1782,6 +1868,8 @@ function confirmDirection() {
   compassState = "collapsed";
   renderCompass();
   setAdventureStatus("active");
+  // 全面の方向パネルが閉じてから、対象セルの発光と表示範囲の補正を始める。
+  selectAndShowTargetCell();
   renderAdventureHud();
   showToast(`${adventureState.direction.label}へ冒険開始！`);
 }
@@ -1801,7 +1889,13 @@ function handleCellDiscoveryFeedback(ix, iy) {
   revealFogCell(ix, iy); // 発光対象以外の未踏セルでも、同じ「霧が晴れる」演出を行う
   if (isTargetCell) {
     flashTargetGlow();
-    setTimeout(clearTargetCell, CELL_FOG_CONFIG.revealDurationMs); // 霧が晴れ切る頃に発光レイヤーごと片付ける
+    const reachedGlowLayer = activeTargetGlowLayer;
+    setTimeout(() => {
+      // 到達後すぐ別の冒険を始めても、古いタイマーで新しい発光を消さない。
+      if (activeTargetGlowLayer === reachedGlowLayer) {
+        clearTargetCell("target-reached");
+      }
+    }, CELL_FOG_CONFIG.revealDurationMs); // 霧が晴れ切る頃に発光レイヤーごと片付ける
   }
   logCellFogDebug("cell-discovered", {
     currentCellId: cellKey(ix, iy),

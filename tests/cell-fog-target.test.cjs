@@ -12,7 +12,11 @@ function loadProductionCellFog() {
   const exposeTestHooks = `
     globalThis.__cellFogTestHooks = {
       findFirstUnvisitedCellAlongDirection,
+      keepTargetCellInView,
       cellKey,
+      setMap(value) {
+        map = value;
+      },
       setVisited(keys) {
         visited = {};
         for (const key of keys) visited[key] = { ts: 0, lat: 0, lon: 0 };
@@ -36,6 +40,9 @@ function loadProductionCellFog() {
     localStorage: {
       getItem: () => null,
       setItem: () => {},
+    },
+    L: {
+      point: (x, y) => ({ x, y }),
     },
     navigator: {},
     performance,
@@ -109,4 +116,29 @@ test("config: targetMaxSteps and ringCells are finite positive numbers (guards a
   assert.ok(Number.isFinite(cellFog.config.targetMaxSteps) && cellFog.config.targetMaxSteps > 0);
   assert.ok(Number.isFinite(cellFog.config.ringCells) && cellFog.config.ringCells > 0);
   assert.ok(Number.isFinite(cellFog.config.maxRenderedFogCells) && cellFog.config.maxRenderedFogCells > 0);
+  for (const value of Object.values(cellFog.config.targetViewportPaddingPx)) {
+    assert.ok(Number.isFinite(value) && value >= 0);
+  }
+});
+
+test("target viewport: pans only through Leaflet with the configured safe-area padding", () => {
+  const calls = [];
+  const center = { lat: 35, lng: 139 };
+  cellFog.setMap({
+    panInside(target, options) {
+      calls.push({ target, options });
+    },
+  });
+
+  cellFog.keepTargetCellInView({
+    getBounds: () => ({ getCenter: () => center }),
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].target, center);
+  assert.equal(calls[0].options.paddingTopLeft.x, cellFog.config.targetViewportPaddingPx.left);
+  assert.equal(calls[0].options.paddingTopLeft.y, cellFog.config.targetViewportPaddingPx.top);
+  assert.equal(calls[0].options.paddingBottomRight.x, cellFog.config.targetViewportPaddingPx.right);
+  assert.equal(calls[0].options.paddingBottomRight.y, cellFog.config.targetViewportPaddingPx.bottom);
+  assert.equal(calls[0].options.animate, true);
 });

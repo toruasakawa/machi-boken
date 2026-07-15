@@ -2,6 +2,13 @@
    マチ冒険 MVP — 未踏セル開放 × 勾配クエスト
    ========================================================== */
 
+// LeafletのSVGレンダラーは既定でビューポート寸法の10%(padding:0.1)しか描画範囲を
+// 広げないため、それを超えた場所にあるL.rectangle等は座標が空になり完全に不可視化する
+// (色・不透明度・z-index・paneに関係なく起こる)。霧・目標発光は最大 CELL_SIZE_M *
+// (CELL_FOG_CONFIG.ringCells|targetMaxSteps + 1) メートル先まで生成するため、それを
+// 安全に包含できる値にしておく（実測: 375px/320px幅いずれもpadding:4で全セル正常描画）。
+const MAP_SVG_RENDER_PADDING = 4;
+
 const CELL_SIZE_M = 200; // 1セルの一辺（メートル）
 const QUEST_RING_CELLS = 4; // 現在地から何セル分の範囲でクエスト候補を探すか（≒800m）
 const MAX_QUEST_CANDIDATES = 10; // 標高APIに投げる候補数の上限
@@ -224,6 +231,9 @@ let map, cellsLayer, questLayer, meMarker;
 
 // 未踏セルの霧・目標セル発光の状態（すべてセッション限定。localStorageへは保存しない）
 let fogLayer = null; // 霧レイヤー（L.layerGroup）
+let fogRenderer = null; // 霧pane専用のSVGレンダラー（padding拡張のため個別に生成する。理由はinitMap参照）
+let targetGlowRenderer = null; // 発光pane専用のSVGレンダラー（同上）
+let currentLocationRenderer = null; // 現在地pane専用のSVGレンダラー（冒険で地図中心から離れても消えないように同様に拡張）
 const fogLayersByCellId = new Map(); // セルID -> 霧のLeafletレイヤー（重複防止・差分更新用）
 let lastFogCenterCell = null; // 直近に霧を再計算した中心セル（無駄な再計算を防ぐ）
 let activeTargetCell = null; // {ix, iy} | null — 現在発光中の最初の未踏セル（強制目標ではない）
@@ -253,12 +263,28 @@ function initMap(lat, lon) {
   currentLocationPane.style.zIndex = 450; // 発光より上、クエスト旗(markerPane=600)より下に現在地を保つ
   currentLocationPane.style.pointerEvents = "none";
 
+  // 独自paneはLeafletの既定レンダラー(map.options.renderer)を継承せず、パン名ごとに
+  // 新しいSVGレンダラーをpadding:0.1(既定)で自動生成してしまう。霧・目標発光は最大
+  // CELL_SIZE_M*(ringCells|targetMaxSteps + 1) メートル先まで生成するため、既定paddingの
+  // 描画範囲を超えたセルは座標が空になり完全に不可視化する（色・z-indexとは無関係の不具合）。
+  // 現在地マーカーも、冒険で歩いて地図中心から離れると同じ理由で消えうるため合わせて対象にする。
+  // pane専用のレンダラーを明示的に作り、各レイヤー生成時にrendererオプションで渡すことで防ぐ。
+  fogRenderer = L.svg({ pane: "fogPane", padding: MAP_SVG_RENDER_PADDING }).addTo(map);
+  targetGlowRenderer = L.svg({ pane: "targetGlowPane", padding: MAP_SVG_RENDER_PADDING }).addTo(
+    map,
+  );
+  currentLocationRenderer = L.svg({
+    pane: "currentLocationPane",
+    padding: MAP_SVG_RENDER_PADDING,
+  }).addTo(map);
+
   fogLayer = L.layerGroup().addTo(map);
   cellsLayer = L.layerGroup().addTo(map);
   questLayer = L.layerGroup().addTo(map);
 
   meMarker = L.circleMarker([lat, lon], {
     pane: "currentLocationPane",
+    renderer: currentLocationRenderer,
     radius: 7,
     color: "#f59e0b",
     fillColor: "#f59e0b",
@@ -374,6 +400,7 @@ function updateFogCells(lat, lon) {
     const [ix, iy] = key.split("_").map(Number);
     const rect = L.rectangle(cellBoundsLatLon(ix, iy), {
       pane: "fogPane",
+      renderer: fogRenderer, // pane既定のレンダラー(padding不足)ではなく、拡張paddingのレンダラーを明示使用
       interactive: false,
       className: "map-cell-fog",
       color: CELL_FOG_CONFIG.strokeColor,
@@ -468,6 +495,7 @@ function drawTargetCellGlow(ix, iy) {
   if (!map) return null;
   activeTargetGlowLayer = L.rectangle(cellBoundsLatLon(ix, iy), {
     pane: "targetGlowPane",
+    renderer: targetGlowRenderer, // pane既定のレンダラー(padding不足)ではなく、拡張paddingのレンダラーを明示使用
     interactive: false,
     className: "target-cell-glow",
     color: CELL_FOG_CONFIG.targetStrokeColor,

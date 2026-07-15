@@ -878,62 +878,45 @@ body {
   }
 }
 
-/* 新規セル開放時の色の広がり */
-.cell-rect {
-  transition:
-    fill-opacity 0.55s ease,
-    opacity 0.55s ease;
-}
-
-/* 未踏セルの霧（検証実装）。JS側 CELL_FOG_CONFIG.revealDurationMs と秒数を合わせること */
-.map-cell-fog {
-  transition:
-    fill-opacity 700ms ease-out,
-    stroke-opacity 700ms ease-out;
-}
+/* 未踏セルの霧が晴れる演出。一瞬明るくなってから透明になる（JS側 CELL_FOG_CONFIG.revealDurationMs/
+   flashDurationMs と数値・秒数を合わせること。基準値: fillOpacity 0.8, strokeOpacity 0.25） */
 .map-cell-fog.is-revealing {
-  fill-opacity: 0;
-  stroke-opacity: 0;
+  animation: fog-reveal 850ms ease-out forwards;
+}
+@keyframes fog-reveal {
+  0% {
+    fill-opacity: 0.8;
+    stroke-opacity: 0.25;
+  }
+  16% {
+    fill-opacity: 0.92;
+    stroke-opacity: 0.45;
+  }
+  100% {
+    fill-opacity: 0;
+    stroke-opacity: 0;
+  }
 }
 
-/* 標識で確定した方向にある、最初の未踏セルの発光（検証実装）。
-   目的地ピンに見えないよう、黄色（訪問済みセル色）は使わず白〜淡い青緑系でゆっくり明滅させる。
-   呼吸周期はJS側 CELL_FOG_CONFIG.targetPulseDurationMs からCSS変数で受け取る。 */
-.target-cell-glow {
-  fill-opacity: 0.1;
-  stroke: #0f766e;
-  stroke-width: 3px;
-  stroke-opacity: 0.75;
-  vector-effect: non-scaling-stroke;
-  filter: drop-shadow(0 0 5px rgba(45, 212, 191, 0.9));
-  transition:
-    fill-opacity 260ms ease-out,
-    stroke-opacity 260ms ease-out;
-  animation: target-cell-breathe var(--target-pulse-duration, 2200ms)
-    ease-in-out infinite;
+/* 霧が消え始めてから、探索済みセル色を下から現れるようにフェードインする。
+   最終的な不透明度はJSが --explored-fill-opacity / --explored-stroke-opacity として渡す
+   （JS側 CELL_FOG_CONFIG.exploredFadeInDelayMs/exploredFadeInDurationMs と合わせること） */
+.map-cell-explored.is-revealing {
+  animation: explored-cell-appear 600ms ease-out 250ms both;
 }
-.target-cell-glow.is-flashing {
-  animation: none;
-  fill-opacity: 0.42;
-  stroke-opacity: 1;
-}
-@keyframes target-cell-breathe {
-  0%,
-  100% {
-    fill-opacity: 0.1;
-    stroke-opacity: 0.75;
+@keyframes explored-cell-appear {
+  from {
+    fill-opacity: 0;
+    stroke-opacity: 0;
   }
-  50% {
-    fill-opacity: 0.3;
-    stroke-opacity: 1;
+  to {
+    fill-opacity: var(--explored-fill-opacity, 0.28);
+    stroke-opacity: var(--explored-stroke-opacity, 1);
   }
 }
 
 /* prefers-reduced-motion: 高速回転・紙吹雪・広がりアニメーションを簡略化 */
 @media (prefers-reduced-motion: reduce) {
-  .cell-rect {
-    transition: none;
-  }
   .frontier-arrow {
     transition: none;
   }
@@ -947,16 +930,11 @@ body {
   .sign-board {
     transition: transform 0.22s ease-out;
   }
-  /* 霧は短いフェードのみ、発光は明滅させず静的な薄い輪郭にとどめる */
-  .map-cell-fog {
-    transition:
-      fill-opacity 150ms linear,
-      stroke-opacity 150ms linear;
-  }
-  .target-cell-glow {
-    animation: none;
-    fill-opacity: 0.16;
-    stroke-opacity: 0.9;
+  /* 霧はJS側で即時解除するため通常ここへは到達しないが、念のため短いフェードに留める */
+  .map-cell-fog.is-revealing,
+  .map-cell-explored.is-revealing {
+    animation-duration: 150ms;
+    animation-delay: 0ms;
   }
 }
 

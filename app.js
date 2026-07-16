@@ -74,8 +74,37 @@ const COMPLETION_MESSAGES = [
 ];
 
 // 夜間セーフティ: 端末のローカル時刻ベース（18:00〜翌5:59を夜間とする）
+// 夜間でも冒険時間・目標セル数は昼間と同じ3コースを維持し、時間制限はしない。
+// 「知らない道」を積極的に推奨せず、安全な道を選ぶよう文言だけで促す方針。
 const NIGHT_START_HOUR = 18;
 const NIGHT_END_HOUR = 6; // この時刻未満は夜間
+
+// 夜間の方向確定後の補足文（プリセットごと）。「普段なら選ばない道」を推奨せず、
+// 安全な道を選ぶことを促す。昼間の文言(onSignSettled内)はここでは変更しない。
+const NIGHT_DIRECTION_SUB_TEXT = {
+  short: "この方角を意識しながら、明るく歩き慣れた道を少し歩いてみよう。",
+  normal: "この方角を意識しつつ、慣れた道や人通りのある道を歩いてみよう。",
+  long: "無理をせず、明るく安全な道を選んで歩いてみよう。",
+};
+
+const DEBUG_NIGHT_MODE = false; // trueにすると夜間モードの判定値をコンソールへ出力する（本番はfalse）
+
+function logNightModeDebug(event) {
+  if (!DEBUG_NIGHT_MODE) return;
+  console.log("[night-mode]", event, {
+    localTime: new Date().toTimeString().slice(0, 8),
+    isNightTime: isNightTime(),
+    selectedPresetMinutes: adventureState.preset
+      ? ADVENTURE_PRESETS[adventureState.preset].minutes
+      : null,
+    availablePresetMinutes: ADVENTURE_PRESET_ORDER.map(
+      (key) => ADVENTURE_PRESETS[key].minutes,
+    ),
+    nightSafetyAcknowledged: adventureState.nightSafetyAcknowledged,
+    nightCopyVariant: adventureState.preset,
+    adventureStartAllowed: !isNightTime() || adventureState.nightSafetyAcknowledged,
+  });
+}
 
 // 方角の重み付け: index=フロンティア方位からの円環距離(0=最優先,4=反対)
 const DIRECTION_WEIGHT_BY_DISTANCE = [10, 5, 2, 1, 1];
@@ -766,6 +795,7 @@ const adventureState = {
   startLatLon: null, // 冒険開始地点（帰り道用）
   targetReached: false,
   sessionDiscoveredCellIds: [], // 今回のセッションで新規開放したセル {ix,iy}（共有カードのシルエット表示専用。重複追加はしない）
+  nightSafetyAcknowledged: false, // 夜間注意を確認済みか（セッション限定。同じ冒険開始フロー内での再表示を防ぐ）
 };
 
 function renderAdventureUI() {
@@ -794,6 +824,7 @@ function resetAdventureStateKeepHistory() {
   adventureState.startLatLon = null;
   adventureState.targetReached = false;
   adventureState.sessionDiscoveredCellIds = [];
+  adventureState.nightSafetyAcknowledged = false; // 新しい冒険開始時は夜間注意を再表示してよいためリセットする
 }
 
 function renderAdventureHud() {
@@ -809,11 +840,14 @@ function renderAdventureHud() {
 function beginAdventureFlow() {
   if (adventureState.status !== "idle" && adventureState.status !== "completed")
     return;
-  if (isNightTime()) {
+  // 夜間は時間・コースを制限せず、まだ今回の冒険開始フロー内で注意を確認していない場合だけ
+  // 一度注意文を挟む（同じフロー内での再表示はしない。新しい冒険開始時はリセットされる）。
+  if (isNightTime() && !adventureState.nightSafetyAcknowledged) {
     showNightWarning();
   } else {
-    showDurationPanel({ nightRestricted: false });
+    showDurationPanel();
   }
+  logNightModeDebug("begin-adventure-flow");
 }
 
 function endAdventure() {
@@ -831,7 +865,10 @@ function isNightTime(date) {
   return h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR;
 }
 
+let nightWarningReturnFocusEl = null; // 閉じた後に元の操作要素へフォーカスを戻すため保持する
+
 function showNightWarning() {
+  nightWarningReturnFocusEl = document.activeElement;
   const panel = el("night-warning-panel");
   panel.classList.remove("hidden");
   const firstBtn = panel.querySelector("button");
@@ -840,6 +877,10 @@ function showNightWarning() {
 
 function hideNightWarning() {
   el("night-warning-panel").classList.add("hidden");
+  if (nightWarningReturnFocusEl && typeof nightWarningReturnFocusEl.focus === "function") {
+    nightWarningReturnFocusEl.focus();
+  }
+  nightWarningReturnFocusEl = null;
 }
 
 /* ---------- 冒険時間選択 ---------- */
@@ -856,13 +897,11 @@ function renderDurationOptions() {
   });
 }
 
-function showDurationPanel(opts) {
-  const nightRestricted = !!(opts && opts.nightRestricted) || isNightTime();
-  el("duration-option-normal").classList.toggle("hidden", nightRestricted);
-  el("duration-option-long").classList.toggle("hidden", nightRestricted);
+function showDurationPanel() {
+  // 夜間も5分・15分・30分のすべてを選択可能にする（時間制限はしない）。
   setAdventureStatus("choosingDuration");
-  const firstVisible = document.querySelector(".duration-option:not(.hidden)");
-  if (firstVisible) firstVisible.focus();
+  const firstOption = document.querySelector(".duration-option");
+  if (firstOption) firstOption.focus();
 }
 
 function selectAdventurePreset(presetKey) {
@@ -1686,13 +1725,16 @@ function onSignSettled(sector) {
   const label = COMPASS_LABELS[sector];
   adventureState.direction = { sector, label, bearingDeg: sector * 45 };
   el("direction-result-text").textContent = `今日は${label}へ。`;
-  el("direction-result-sub").textContent =
-    "最初の200〜300mだけ、この方向を意識してみよう。";
+  // 夜間は「普段なら選ばない道」を推奨せず、安全な道を選ぶ補足へ差し替える（昼間の文言は変更しない）。
+  el("direction-result-sub").textContent = isNightTime()
+    ? NIGHT_DIRECTION_SUB_TEXT[adventureState.preset] || NIGHT_DIRECTION_SUB_TEXT.normal
+    : "最初の200〜300mだけ、この方向を意識してみよう。";
   el("direction-result").classList.remove("hidden");
   // #sign-boardはaria-hiddenな視覚要素なので、読み上げ用にsr-onlyのライブリージョンへ結果を通知する。
   el("sign-sr-status").textContent = `方角が決まりました。今日は${label}へ。`;
   const confirmBtn = el("btn-confirm-direction");
   if (confirmBtn) confirmBtn.focus();
+  logNightModeDebug("sign-settled");
 }
 
 function showDirectionPanel() {
@@ -2260,8 +2302,9 @@ window.addEventListener("DOMContentLoaded", () => {
     setAdventureStatus("idle");
   });
   el("btn-night-continue").addEventListener("click", () => {
+    adventureState.nightSafetyAcknowledged = true;
     hideNightWarning();
-    showDurationPanel({ nightRestricted: true });
+    showDurationPanel();
   });
 
   // ---- 冒険開始・終了 ----

@@ -64,14 +64,14 @@
   <p>現在地を取得しています…</p>
 </div>
 
-<!-- 夜間セーフティ警告 -->
-<div id="night-warning-panel" class="hidden" role="dialog" aria-modal="true" aria-labelledby="night-warning-title">
+<!-- 夜間セーフティ注意（時間・コースは制限しない。安全な道を選ぶための一度きりの案内） -->
+<div id="night-warning-panel" class="hidden" role="dialog" aria-modal="true" aria-labelledby="night-warning-title" aria-describedby="night-warning-desc">
   <div class="night-warning-card">
     <h2 id="night-warning-title">夜の冒険は、安全第一。</h2>
-    <p>知らない道を歩く冒険は、明るい時間をおすすめしています。</p>
+    <p id="night-warning-desc">慣れた道や、明るく人通りのある道を歩いてください。</p>
     <div class="night-warning-actions">
-      <button id="btn-night-cancel" type="button">今日はやめる</button>
-      <button id="btn-night-continue" type="button">それでも短い冒険を始める</button>
+      <button id="btn-night-cancel" type="button">今夜はやめる</button>
+      <button id="btn-night-continue" type="button">注意して冒険する</button>
     </div>
   </div>
 </div>

@@ -46,6 +46,18 @@
   <button id="btn-end-adventure" class="adventure-end-btn" type="button">冒険を終える</button>
 </div>
 
+<!-- 時間達成後も冒険を継続したまま、終了または5分延長を選べる軽い通知 -->
+<div id="time-goal-panel" class="time-goal-panel hidden" role="dialog" aria-modal="true" aria-labelledby="time-goal-title" aria-describedby="time-goal-sub">
+  <div class="time-goal-card">
+    <h2 id="time-goal-title">今日の冒険を達成しました！</h2>
+    <p id="time-goal-sub">このまま続けても大丈夫。</p>
+    <div class="time-goal-actions">
+      <button id="btn-time-goal-end" class="btn-primary" type="button">冒険を終える</button>
+      <button id="btn-time-goal-extend" class="btn-secondary" type="button">あと5分だけ続ける</button>
+    </div>
+  </div>
+</div>
+
 <!-- 位置情報許可前のオーバーレイ -->
 <div id="permission-screen">
   <div class="permission-card">
@@ -125,11 +137,16 @@
 <div id="completion-sheet" class="sheet hidden" role="dialog" aria-modal="true" aria-labelledby="completion-title">
   <div class="sheet-handle"></div>
   <h2 id="completion-title">今日の冒険、おつかれさま！</h2>
+  <section id="adventure-route-summary" class="adventure-route-summary hidden">
+    <h3 class="adventure-route-heading">今日歩いた形</h3>
+    <svg id="adventure-route-shape" class="adventure-route-shape" viewBox="0 0 320 170" role="img" aria-label="今日歩いたルートの形">
+      <path id="adventure-route-path" class="adventure-route-path"></path>
+    </svg>
+  </section>
   <ul class="completion-stats">
-    <li><span class="completion-label">選んだ時間</span><span id="completion-duration"></span></li>
-    <li><span class="completion-label">決定した方向</span><span id="completion-direction"></span></li>
-    <li><span class="completion-label">今回発見した新しい場所</span><span id="completion-session-cells"></span></li>
-    <li><span class="completion-label">累計発見した場所</span><span id="completion-total-cells"></span></li>
+    <li><span class="completion-label">冒険時間</span><span id="completion-elapsed"></span></li>
+    <li><span class="completion-label">歩いた距離</span><span id="completion-distance"></span></li>
+    <li><span class="completion-label">新しい場所</span><span id="completion-discovered-cells"></span></li>
   </ul>
   <p id="completion-message" class="completion-message"></p>
   <button id="btn-show-achievement-card" class="share-trigger-btn" type="button">成果カードを見る</button>
@@ -211,7 +228,10 @@
 </div>
 
 <!-- 到達トースト -->
-<div id="toast" class="hidden"></div>
+<div id="toast" class="hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<!-- 未踏セル発見は通常トーストと分け、2段階の読み時間を保つ -->
+<div id="discovery-message" class="hidden" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <!-- 発見数の節目演出（紙吹雪） -->
 <div id="confetti-layer" aria-hidden="true"></div>

@@ -43,14 +43,82 @@ const CELL_FOG_CONFIG = {
 };
 const DEBUG_CELL_FOG = false; // trueにすると霧の計測値をコンソールへ出力する（本番はfalse）
 
-// 冒険プリセット: 時間は厳密なタイマーではなく「新しく開放するセル数」の目安として使う。
-// 値を変えたい場合はここだけ調整すればよい。
+// 冒険プリセット: 達成条件は選択した時間。セル数は成果としてのみ扱う。
 const ADVENTURE_PRESETS = {
-  short: { minutes: 5, targetCells: 2 },
-  normal: { minutes: 15, targetCells: 5 },
-  long: { minutes: 30, targetCells: 8 },
+  short: {
+    minutes: 5,
+    label: "ちょい冒険",
+    targetDurationMs: 5 * 60 * 1000,
+  },
+  normal: {
+    minutes: 15,
+    label: "いつもの冒険",
+    targetDurationMs: 15 * 60 * 1000,
+  },
+  long: {
+    minutes: 30,
+    label: "じっくり冒険",
+    targetDurationMs: 30 * 60 * 1000,
+  },
 };
 const ADVENTURE_PRESET_ORDER = ["short", "normal", "long"];
+const ADVENTURE_TIMER_INTERVAL_MS = 1000;
+const ADVENTURE_EXTENSION_MS = 5 * 60 * 1000;
+const TIME_GOAL_PRESENTATION_DELAY_MS = 180;
+
+// 距離は終了画面用。小さなGPS揺れと明らかなジャンプを成果へ混ぜない。
+const DISTANCE_MIN_STEP_M = 3;
+const DISTANCE_MAX_STEP_M = 500;
+const DISTANCE_MAX_SPEED_MPS = 4.5;
+const DISTANCE_MAX_ACCURACY_M = 35;
+
+// 冒険中に歩いたGPS軌跡を、終了画面で抽象的な線として見せるための記録設定。
+// 精度・速度・ジャンプ判定は距離計測(DISTANCE_MAX_ACCURACY_M等)と同じ基準を参照し、
+// 「距離表示とルート形状で採用するGPS点の基準が大きく異ならない」ようにする。
+// ここに無いのは「新しい点として保存するか」という記録間隔だけの追加条件。
+const ROUTE_RECORDING_CONFIG = {
+  maxAccuracyM: DISTANCE_MAX_ACCURACY_M,
+  minDistanceM: 10, // 前回保存点からこれ以上動いたら新しい点を保存する
+  maxIntervalMs: 15000, // これ以上経過し、かつ少し位置が変化していれば保存する
+  minIntervalDistanceM: 3, // ↑の「少し変化」の下限（GPSノイズだけでの保存を避ける）
+  maxSegmentDistanceM: DISTANCE_MAX_STEP_M, // これを超える区間はGPSジャンプとして線に含めない
+  maxSpeedMps: DISTANCE_MAX_SPEED_MPS,
+  maxPoints: 1000, // 配列の上限。超えたら2点に1点へ間引く（先頭の開始点は残す）
+};
+const DEBUG_ROUTE_SHAPE = false; // trueにすると冒険終了時にルート形状の計測値をコンソールへ出力する（本番はfalse）
+
+// ルート形状の描画設定。地図タイルは使わず、SVGの相対座標だけで「形」を残す。
+const ROUTE_SHAPE_VIEWBOX = { width: 320, height: 170, padding: 24 };
+const ROUTE_SHAPE_MIN_SPAN_M = 0.5; // これ未満の幅・高さは「ほぼ同一点」とみなしゼロ除算を避ける
+const ROUTE_SHAPE_DRAW_DURATION_MS = 1000; // 線が描かれるアニメーションの所要時間
+
+// 時間達成は区切りとして軽く見せ、未踏セル発見より派手にしない。
+const TIME_GOAL_COMPLETION_EFFECT = { intensity: "small", durationMs: 1000 };
+const CONFETTI_PIECE_COUNTS = {
+  small: 12,
+  medium: 18,
+  mediumLarge: 24,
+};
+// 霧晴れの後に2段階で見せる。reduced-motionでもhold時間は短縮しない。
+const DISCOVERY_MESSAGE_TIMING = {
+  firstFadeInMs: 150,
+  firstHoldMs: 1500,
+  firstFadeOutMs: 180,
+  secondFadeInMs: 150,
+  secondHoldMs: 1250,
+  secondFadeOutMs: 180,
+  reducedFadeInMs: 80,
+  reducedFadeOutMs: 80,
+};
+const MILESTONE_MESSAGE_TIMING = {
+  fadeInMs: 150,
+  holdMs: 2200,
+  fadeOutMs: 180,
+};
+const ADVENTURE_GOAL_MESSAGE = "今日の冒険を達成しました！";
+const ADVENTURE_GOAL_SUB_MESSAGE = "このまま続けても大丈夫。";
+const ADVENTURE_EXTENSION_MESSAGE = "追加の5分も歩きました。";
+const DEBUG_TIME_GOAL = false;
 
 // 発見数の節目（累計開放セル数）と演出メッセージ
 const MILESTONE_THRESHOLDS = [1, 5, 10, 25, 50, 100];
@@ -72,9 +140,13 @@ const COMPLETION_MESSAGES = [
   "歩いた分だけ、自分の街になっていきます。",
   "次の発見は、一本隣の道にあるかもしれません。",
 ];
+const ADVENTURE_END_MESSAGES = {
+  noDiscovery: "今日の寄り道も、正解でした。",
+  withDiscovery: "またこの街が、少し広くなりました。",
+};
 
 // 夜間セーフティ: 端末のローカル時刻ベース（18:00〜翌5:59を夜間とする）
-// 夜間でも冒険時間・目標セル数は昼間と同じ3コースを維持し、時間制限はしない。
+// 夜間でも冒険時間は昼間と同じ3コースを維持し、時間制限はしない。
 // 「知らない道」を積極的に推奨せず、安全な道を選ぶよう文言だけで促す方針。
 const NIGHT_START_HOUR = 18;
 const NIGHT_END_HOUR = 6; // この時刻未満は夜間
@@ -470,6 +542,11 @@ function updateHud(currentLat, currentLon) {
 }
 
 function showToast(msg, variant) {
+  if (isDiscoveryNotificationActive()) {
+    // 発見中の通常通知は1件だけ保留し、文章同士の重なりと無制限キューを防ぐ。
+    showToast._pending = { msg, variant };
+    return;
+  }
   const t = el("toast");
   t.textContent = msg;
   t.classList.remove("hidden");
@@ -788,15 +865,116 @@ function updateFrontierCompassFlow(lat, lon, reliable) {
 const adventureState = {
   status: "idle", // idle | choosingDuration | choosingDirection | active | completed
   preset: null,
-  targetCells: 0,
-  discoveredCells: 0,
   direction: null, // {sector, label, bearingDeg}
   startedAt: null,
+  endedAt: null,
+  elapsedAdventureMs: 0,
+  targetDurationMs: 0,
   startLatLon: null, // 冒険開始地点（帰り道用）
-  targetReached: false,
-  sessionDiscoveredCellIds: [], // 今回のセッションで新規開放したセル {ix,iy}（共有カードのシルエット表示専用。重複追加はしない）
+  startCellId: null,
+  hasLeftStartCell: false,
+  goalReached: false,
+  initialGoalReached: false,
+  initialGoalEffectShown: false,
+  timeGoalPresentationIsInitial: false,
+  extensionCount: 0,
+  sessionVisitedCellIds: new Set(),
+  sessionVisitedCells: [], // 後から匿名形状へ利用できるよう、相対化前のセル座標も一時保持する
+  sessionDiscoveredCellIds: new Set(),
+  sessionDiscoveredCells: [], // 共有カードの既存シルエット表示用
+  distanceMeters: 0,
+  lastDistancePoint: null,
+  routePoints: [], // 冒険中に記録したGPS軌跡 [{lat,lon,timestamp,accuracy,cumulativeDistanceM}]（セッション限定）
+  lastRoutePoint: null, // 直前に「保存」した有効なルート点（記録間隔の判定に使う。lastDistancePointとは別管理）
+  completionData: null,
+  currentCellId: null,
+  discoveryFeedbackUntil: 0,
   nightSafetyAcknowledged: false, // 夜間注意を確認済みか（セッション限定。同じ冒険開始フロー内での再表示を防ぐ）
+  sessionId: 0, // 遅延した達成演出が次の冒険へ持ち越されないよう、新しいコース選択ごとに更新する
 };
+let adventureFeedbackTimerIds = [];
+let adventureTimerId = null;
+
+function clearAdventureFeedbackTimers() {
+  adventureFeedbackTimerIds.forEach((timerId) => clearTimeout(timerId));
+  adventureFeedbackTimerIds = [];
+}
+
+function scheduleAdventureFeedbackAction(sessionId, delayMs, action) {
+  const timerId = setTimeout(() => {
+    adventureFeedbackTimerIds = adventureFeedbackTimerIds.filter(
+      (id) => id !== timerId,
+    );
+    if (adventureState.sessionId !== sessionId) return;
+    action();
+  }, delayMs);
+  adventureFeedbackTimerIds.push(timerId);
+}
+
+function stopAdventureTimer() {
+  if (adventureTimerId != null) {
+    clearInterval(adventureTimerId);
+    adventureTimerId = null;
+  }
+}
+
+function startAdventureTimer() {
+  stopAdventureTimer();
+  updateAdventureTime();
+  adventureTimerId = setInterval(
+    updateAdventureTime,
+    ADVENTURE_TIMER_INTERVAL_MS,
+  );
+}
+
+function getElapsedAdventureMs(startedAt, now) {
+  if (!Number.isFinite(startedAt) || !Number.isFinite(now)) return 0;
+  return Math.max(0, now - startedAt);
+}
+
+function formatAdventureMinutes(durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs < 60 * 1000) return "1分未満";
+  return `${Math.floor(durationMs / (60 * 1000))}分`;
+}
+
+function formatAdventureDistance(distanceMeters) {
+  if (!Number.isFinite(distanceMeters) || distanceMeters <= 0) return "0m";
+  if (distanceMeters < 1000) return `${Math.round(distanceMeters)}m`;
+  return `${(distanceMeters / 1000).toFixed(1)}km`;
+}
+
+function logTimeGoalDebug(event, overrides) {
+  if (!DEBUG_TIME_GOAL) return;
+  const preset = adventureState.preset
+    ? ADVENTURE_PRESETS[adventureState.preset]
+    : null;
+  console.log("[time-goal]", event, {
+    selectedPresetMinutes: preset ? preset.minutes : null,
+    startedAt: adventureState.startedAt,
+    elapsedAdventureMs: adventureState.elapsedAdventureMs,
+    targetDurationMs: adventureState.targetDurationMs,
+    goalReached: adventureState.goalReached,
+    initialGoalReached: adventureState.initialGoalReached,
+    extensionCount: adventureState.extensionCount,
+    sessionVisitedCellCount: adventureState.sessionVisitedCellIds.size,
+    sessionDiscoveredCellCount: adventureState.sessionDiscoveredCellIds.size,
+    currentCellId: adventureState.currentCellId,
+    timeGoalTriggered: false,
+    discoveryTriggered: false,
+    ...(overrides || {}),
+  });
+}
+
+function updateAdventureTime(now) {
+  if (adventureState.status !== "active" || !adventureState.startedAt) return;
+  const currentTime = Number.isFinite(now) ? now : Date.now();
+  adventureState.elapsedAdventureMs = getElapsedAdventureMs(
+    adventureState.startedAt,
+    currentTime,
+  );
+  renderAdventureHud();
+  triggerAdventureTimeGoal();
+}
 
 function renderAdventureUI() {
   const s = adventureState.status;
@@ -808,6 +986,7 @@ function renderAdventureUI() {
     "hidden",
     !(s === "idle" || s === "completed"),
   );
+  if (s !== "active") hideTimeGoalPanel(false);
 }
 
 function setAdventureStatus(status) {
@@ -816,14 +995,33 @@ function setAdventureStatus(status) {
 }
 
 function resetAdventureStateKeepHistory() {
+  stopAdventureTimer();
+  clearAdventureFeedbackTimers();
+  clearDiscoveryNotification({ flushPendingToast: false });
   adventureState.preset = null;
-  adventureState.targetCells = 0;
-  adventureState.discoveredCells = 0;
   adventureState.direction = null;
   adventureState.startedAt = null;
+  adventureState.endedAt = null;
+  adventureState.elapsedAdventureMs = 0;
+  adventureState.targetDurationMs = 0;
   adventureState.startLatLon = null;
-  adventureState.targetReached = false;
-  adventureState.sessionDiscoveredCellIds = [];
+  adventureState.startCellId = null;
+  adventureState.hasLeftStartCell = false;
+  adventureState.goalReached = false;
+  adventureState.initialGoalReached = false;
+  adventureState.initialGoalEffectShown = false;
+  adventureState.timeGoalPresentationIsInitial = false;
+  adventureState.extensionCount = 0;
+  adventureState.sessionVisitedCellIds = new Set();
+  adventureState.sessionVisitedCells = [];
+  adventureState.sessionDiscoveredCellIds = new Set();
+  adventureState.sessionDiscoveredCells = [];
+  adventureState.distanceMeters = 0;
+  adventureState.lastDistancePoint = null;
+  adventureState.routePoints = [];
+  adventureState.lastRoutePoint = null;
+  adventureState.completionData = null;
+  adventureState.discoveryFeedbackUntil = 0;
   adventureState.nightSafetyAcknowledged = false; // 新しい冒険開始時は夜間注意を再表示してよいためリセットする
 }
 
@@ -832,7 +1030,17 @@ function renderAdventureHud() {
   el("adventure-hud-direction").textContent =
     `${adventureState.direction.label}へ冒険中`;
   el("adventure-hud-progress").textContent =
-    `新しい場所 ${adventureState.discoveredCells} / ${adventureState.targetCells}`;
+    getAdventureProgressText({
+      elapsedAdventureMs: adventureState.elapsedAdventureMs,
+      sessionVisitedCellCount: adventureState.sessionVisitedCellIds.size,
+    });
+}
+
+function getAdventureProgressText({
+  elapsedAdventureMs,
+  sessionVisitedCellCount,
+}) {
+  return `冒険中 ${formatAdventureMinutes(elapsedAdventureMs)} ・ 歩いた場所 ${sessionVisitedCellCount}`;
 }
 
 // アプリ起動後、初回の位置取得・地図準備が完了した直後に一度だけ呼ばれる（handlePosition内）。
@@ -852,8 +1060,14 @@ function beginAdventureFlow() {
 
 function endAdventure() {
   if (adventureState.status !== "active") return;
+  updateAdventureTime();
+  adventureState.endedAt = Date.now();
+  adventureState.completionData = getAdventureCompletionData();
+  stopAdventureTimer();
+  clearAdventureFeedbackTimers();
+  clearDiscoveryNotification({ flushPendingToast: false });
   setAdventureStatus("completed");
-  showCompletionSheet();
+  showCompletionSheet(adventureState.completionData);
 }
 
 /* ---------- 夜間セーフティ ----------
@@ -892,8 +1106,7 @@ function renderDurationOptions() {
     );
     if (!btn) return;
     btn.querySelector(".duration-minutes").textContent = `${preset.minutes}分`;
-    btn.querySelector(".duration-desc").textContent =
-      `新しい場所を${preset.targetCells}つ`;
+    btn.querySelector(".duration-desc").textContent = preset.label;
   });
 }
 
@@ -907,10 +1120,33 @@ function showDurationPanel() {
 function selectAdventurePreset(presetKey) {
   const preset = ADVENTURE_PRESETS[presetKey];
   if (!preset) return;
+  clearAdventureFeedbackTimers();
+  clearDiscoveryNotification({ flushPendingToast: false });
+  stopAdventureTimer();
+  adventureState.sessionId++;
   adventureState.preset = presetKey;
-  adventureState.targetCells = preset.targetCells;
-  adventureState.discoveredCells = 0;
-  adventureState.targetReached = false;
+  adventureState.direction = null;
+  adventureState.startedAt = null;
+  adventureState.endedAt = null;
+  adventureState.elapsedAdventureMs = 0;
+  adventureState.targetDurationMs = preset.targetDurationMs;
+  adventureState.startCellId = null;
+  adventureState.hasLeftStartCell = false;
+  adventureState.goalReached = false;
+  adventureState.initialGoalReached = false;
+  adventureState.initialGoalEffectShown = false;
+  adventureState.timeGoalPresentationIsInitial = false;
+  adventureState.extensionCount = 0;
+  adventureState.sessionVisitedCellIds = new Set();
+  adventureState.sessionVisitedCells = [];
+  adventureState.sessionDiscoveredCellIds = new Set();
+  adventureState.sessionDiscoveredCells = [];
+  adventureState.distanceMeters = 0;
+  adventureState.lastDistancePoint = null;
+  adventureState.routePoints = [];
+  adventureState.lastRoutePoint = null;
+  adventureState.completionData = null;
+  adventureState.discoveryFeedbackUntil = 0;
   showDirectionPanel();
 }
 
@@ -1763,19 +1999,656 @@ function redoDirection() {
 function confirmDirection() {
   if (!adventureState.direction) return;
   adventureState.startedAt = Date.now();
-  adventureState.startLatLon = lastKnownLatLon ? { ...lastKnownLatLon } : null;
-  adventureState.sessionDiscoveredCellIds = [];
+  adventureState.endedAt = null;
+  adventureState.elapsedAdventureMs = 0;
+  adventureState.startLatLon = lastReliablePosition
+    ? { lat: lastReliablePosition.lat, lon: lastReliablePosition.lon }
+    : lastKnownLatLon
+      ? { ...lastKnownLatLon }
+      : null;
+  adventureState.startCellId = lastReliableCellId;
+  adventureState.currentCellId = lastReliableCellId;
+  adventureState.lastDistancePoint = lastReliablePosition
+    ? { ...lastReliablePosition }
+    : null;
+  // ルート記録は冒険開始の瞬間からにする（時間選択中・標識操作中は記録しない）。
+  // 現在の有効GPS位置があれば開始点として1点目に加える（distanceMetersと同じ考え方）。
+  adventureState.routePoints = [];
+  adventureState.lastRoutePoint = null;
+  if (lastReliablePosition) {
+    const startRoutePoint = {
+      lat: lastReliablePosition.lat,
+      lon: lastReliablePosition.lon,
+      timestamp: Number.isFinite(lastReliablePosition.timestamp)
+        ? lastReliablePosition.timestamp
+        : Date.now(),
+      accuracy: null,
+      cumulativeDistanceM: 0,
+    };
+    adventureState.routePoints.push(startRoutePoint);
+    adventureState.lastRoutePoint = startRoutePoint;
+  }
   compassState = "collapsed";
   renderCompass();
   setAdventureStatus("active");
   renderAdventureHud();
+  startAdventureTimer();
   showToast(`${adventureState.direction.label}へ冒険開始！`);
+  logTimeGoalDebug("adventure-started");
 }
 
 /* ---------- セル発見リアクション ----------
    将来SEを追加しやすいよう、視覚・文言・振動のリアクションを一箇所にまとめる。 */
-function handleCellDiscoveryFeedback(ix, iy) {
-  // どの未踏セルへ入っても同じ処理・同じ価値。特定セルだけを特別扱いしない。
+function shouldTriggerAdventureGoal({
+  elapsedAdventureMs,
+  targetDurationMs,
+  goalReached,
+}) {
+  return (
+    !goalReached &&
+    Number.isFinite(elapsedAdventureMs) &&
+    Number.isFinite(targetDurationMs) &&
+    targetDurationMs > 0 &&
+    elapsedAdventureMs >= targetDurationMs
+  );
+}
+
+function getTimeGoalPresentationDelay(now) {
+  const currentTime = Number.isFinite(now) ? now : Date.now();
+  return Math.max(
+    TIME_GOAL_PRESENTATION_DELAY_MS,
+    adventureState.discoveryFeedbackUntil - currentTime,
+  );
+}
+
+let timeGoalReturnFocusEl = null;
+
+function hideTimeGoalPanel(restoreFocus) {
+  const panel = el("time-goal-panel");
+  if (!panel) return;
+  panel.classList.add("hidden");
+  if (
+    restoreFocus !== false &&
+    timeGoalReturnFocusEl &&
+    typeof timeGoalReturnFocusEl.focus === "function"
+  ) {
+    try {
+      timeGoalReturnFocusEl.focus();
+    } catch (e) {
+      // 元の要素が既に無い場合は、冒険継続を優先する。
+    }
+  }
+  timeGoalReturnFocusEl = null;
+}
+
+function showTimeGoalPanel(isInitialGoal) {
+  if (adventureState.status !== "active" || !adventureState.goalReached) return;
+  const panel = el("time-goal-panel");
+  if (!timeGoalReturnFocusEl) timeGoalReturnFocusEl = document.activeElement;
+  adventureState.timeGoalPresentationIsInitial = isInitialGoal;
+  el("time-goal-title").textContent = isInitialGoal
+    ? ADVENTURE_GOAL_MESSAGE
+    : ADVENTURE_EXTENSION_MESSAGE;
+  el("time-goal-sub").textContent = ADVENTURE_GOAL_SUB_MESSAGE;
+  panel.classList.remove("hidden");
+
+  if (isInitialGoal && !adventureState.initialGoalEffectShown) {
+    adventureState.initialGoalEffectShown = true;
+    spawnConfetti(TIME_GOAL_COMPLETION_EFFECT);
+  }
+
+  const firstButton = panel.querySelector("button");
+  if (firstButton) firstButton.focus();
+  logTimeGoalDebug("time-goal-presented", { timeGoalTriggered: true });
+}
+
+function scheduleTimeGoalPresentation(isInitialGoal) {
+  const sessionId = adventureState.sessionId;
+  const attemptPresentation = () => {
+    if (
+      adventureState.status !== "active" ||
+      !adventureState.goalReached ||
+      adventureState.sessionId !== sessionId
+    ) {
+      return;
+    }
+
+    const delayMs = getTimeGoalPresentationDelay();
+    if (delayMs > TIME_GOAL_PRESENTATION_DELAY_MS) {
+      scheduleAdventureFeedbackAction(
+        sessionId,
+        delayMs + TIME_GOAL_PRESENTATION_DELAY_MS,
+        attemptPresentation,
+      );
+      return;
+    }
+
+    showTimeGoalPanel(isInitialGoal);
+  };
+
+  scheduleAdventureFeedbackAction(
+    sessionId,
+    getTimeGoalPresentationDelay(),
+    attemptPresentation,
+  );
+}
+
+function triggerAdventureTimeGoal() {
+  if (
+    !shouldTriggerAdventureGoal({
+      elapsedAdventureMs: adventureState.elapsedAdventureMs,
+      targetDurationMs: adventureState.targetDurationMs,
+      goalReached: adventureState.goalReached,
+    })
+  ) {
+    return false;
+  }
+
+  // 表示より先に立て、インターバル復帰やGPS更新による二重実行を防ぐ。
+  adventureState.goalReached = true;
+  const isInitialGoal = !adventureState.initialGoalReached;
+  if (isInitialGoal) adventureState.initialGoalReached = true;
+  adventureState.timeGoalPresentationIsInitial = isInitialGoal;
+  scheduleTimeGoalPresentation(isInitialGoal);
+  logTimeGoalDebug("time-goal-triggered", { timeGoalTriggered: true });
+  return true;
+}
+
+function extendAdventureFiveMinutes() {
+  if (adventureState.status !== "active" || !adventureState.goalReached) return;
+  adventureState.targetDurationMs += ADVENTURE_EXTENSION_MS;
+  adventureState.extensionCount += 1;
+  adventureState.goalReached = false;
+  hideTimeGoalPanel(true);
+  renderAdventureHud();
+  logTimeGoalDebug("adventure-extended");
+}
+
+function deferVisibleTimeGoalForDiscovery() {
+  const panel = el("time-goal-panel");
+  if (!panel || panel.classList.contains("hidden")) return false;
+  panel.classList.add("hidden");
+  const hudEndButton = el("btn-end-adventure");
+  if (hudEndButton) hudEndButton.focus();
+  scheduleTimeGoalPresentation(adventureState.timeGoalPresentationIsInitial);
+  return true;
+}
+
+function registerAdventureVisitedCell(ix, iy) {
+  if (adventureState.status !== "active") return false;
+  const key = cellKey(ix, iy);
+  adventureState.currentCellId = key;
+
+  if (!adventureState.startCellId) {
+    adventureState.startCellId = key;
+    return false;
+  }
+
+  if (key === adventureState.startCellId && !adventureState.hasLeftStartCell) {
+    return false;
+  }
+
+  if (key !== adventureState.startCellId) {
+    adventureState.hasLeftStartCell = true;
+  }
+
+  if (adventureState.sessionVisitedCellIds.has(key)) return false;
+  adventureState.sessionVisitedCellIds.add(key);
+  adventureState.sessionVisitedCells.push({ ix, iy });
+  renderAdventureHud();
+  return true;
+}
+
+function registerAdventureDistance(lat, lon, timestamp, accuracy) {
+  if (adventureState.status !== "active") return false;
+  if (Number.isFinite(accuracy) && accuracy > DISTANCE_MAX_ACCURACY_M) {
+    return false;
+  }
+  const currentPoint = {
+    lat,
+    lon,
+    timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
+  };
+  const previousPoint = adventureState.lastDistancePoint;
+  if (!previousPoint) {
+    adventureState.lastDistancePoint = currentPoint;
+    return false;
+  }
+
+  const stepMeters = haversineMeters(
+    previousPoint.lat,
+    previousPoint.lon,
+    currentPoint.lat,
+    currentPoint.lon,
+  );
+  const elapsedSeconds = Math.max(
+    0,
+    (currentPoint.timestamp - previousPoint.timestamp) / 1000,
+  );
+  const speedMps = elapsedSeconds > 0 ? stepMeters / elapsedSeconds : Infinity;
+  const isValidStep =
+    Number.isFinite(stepMeters) &&
+    stepMeters >= DISTANCE_MIN_STEP_M &&
+    stepMeters <= DISTANCE_MAX_STEP_M &&
+    speedMps <= DISTANCE_MAX_SPEED_MPS;
+
+  if (!isValidStep) {
+    // 外れ値そのものは加算しないが、次の正常点で復帰できるよう基準点だけ更新する。
+    if (
+      stepMeters > DISTANCE_MAX_STEP_M ||
+      (elapsedSeconds > 0 && speedMps > DISTANCE_MAX_SPEED_MPS)
+    ) {
+      adventureState.lastDistancePoint = currentPoint;
+    }
+    return false;
+  }
+  adventureState.distanceMeters += stepMeters;
+  adventureState.lastDistancePoint = currentPoint;
+  return true;
+}
+
+// 冒険中のGPS点のうち、終了画面の「今日歩いた形」用に残す点だけを間引いて保存する。
+// 精度・速度・ジャンプの判定基準はregisterAdventureDistance()と揃えているが、
+// 「保存するかどうか」はこちらだけの記録間隔(ROUTE_RECORDING_CONFIG)で決める。
+function recordRoutePoint(lat, lon, timestamp, accuracy) {
+  if (adventureState.status !== "active") return false;
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+  if (
+    Number.isFinite(accuracy) &&
+    accuracy > ROUTE_RECORDING_CONFIG.maxAccuracyM
+  ) {
+    return false;
+  }
+  const ts = Number.isFinite(timestamp) ? timestamp : Date.now();
+  const safeAccuracy = Number.isFinite(accuracy) ? accuracy : null;
+
+  const previous = adventureState.lastRoutePoint;
+  if (!previous) {
+    const point = { lat, lon, timestamp: ts, accuracy: safeAccuracy, cumulativeDistanceM: 0 };
+    adventureState.routePoints.push(point);
+    adventureState.lastRoutePoint = point;
+    return true;
+  }
+
+  const stepMeters = haversineMeters(previous.lat, previous.lon, lat, lon);
+  if (!Number.isFinite(stepMeters)) return false;
+
+  const elapsedSeconds = Math.max(0, (ts - previous.timestamp) / 1000);
+  const speedMps = elapsedSeconds > 0 ? stepMeters / elapsedSeconds : Infinity;
+  const isJump =
+    stepMeters > ROUTE_RECORDING_CONFIG.maxSegmentDistanceM ||
+    (elapsedSeconds > 0 && speedMps > ROUTE_RECORDING_CONFIG.maxSpeedMps);
+
+  if (isJump) {
+    // registerAdventureDistance()と違い、基準点は進めない。
+    // ここで基準点をジャンプ先へ進めてしまうと、GPSが元の場所へ自己修正した後の
+    // 正常な一歩が「ジャンプ先からの小さな移動」として採用されてしまい、形状全体の
+    // 縮尺がジャンプ先まで含めて引き伸ばされる（線が極端に縮んで見える）。
+    // 基準点を据え置くことで、GPSが元の位置付近へ戻った時点で自然に復帰できる。
+    return false;
+  }
+
+  const elapsedSincePreviousMs = ts - previous.timestamp;
+  const shouldRecord =
+    stepMeters >= ROUTE_RECORDING_CONFIG.minDistanceM ||
+    (elapsedSincePreviousMs >= ROUTE_RECORDING_CONFIG.maxIntervalMs &&
+      stepMeters >= ROUTE_RECORDING_CONFIG.minIntervalDistanceM);
+  if (!shouldRecord) return false;
+
+  const point = {
+    lat,
+    lon,
+    timestamp: ts,
+    accuracy: safeAccuracy,
+    cumulativeDistanceM: previous.cumulativeDistanceM + stepMeters,
+  };
+  adventureState.routePoints.push(point);
+  adventureState.lastRoutePoint = point;
+
+  if (adventureState.routePoints.length > ROUTE_RECORDING_CONFIG.maxPoints) {
+    thinRoutePoints();
+  }
+  return true;
+}
+
+// 点数が上限を超えたら、開始点(先頭)を残しつつ2点に1点へ間引く。記録自体は止めない。
+function thinRoutePoints() {
+  const points = adventureState.routePoints;
+  if (points.length === 0) return;
+  const thinned = [points[0]];
+  for (let i = 1; i < points.length; i += 2) {
+    thinned.push(points[i]);
+  }
+  adventureState.routePoints = thinned;
+}
+
+function registerAdventureDiscovery(ix, iy) {
+  if (adventureState.status !== "active") return false;
+  const key = cellKey(ix, iy);
+
+  if (adventureState.sessionDiscoveredCellIds.has(key)) return false;
+
+  adventureState.sessionDiscoveredCellIds.add(key);
+  adventureState.sessionDiscoveredCells.push({ ix, iy });
+  return true;
+}
+
+const discoveryNotificationState = {
+  token: 0,
+  phase: "idle", // idle | waiting | first | milestone | second
+  sessionId: null,
+  latestCount: null,
+  milestoneThreshold: null,
+  phaseEndsAt: 0,
+  timerId: null,
+};
+
+function getDiscoveryMessageTiming(reducedMotion) {
+  const shortFadeMs = DISCOVERY_MESSAGE_TIMING.reducedFadeInMs;
+  const shortFadeOutMs = DISCOVERY_MESSAGE_TIMING.reducedFadeOutMs;
+  return {
+    firstFadeInMs: reducedMotion
+      ? shortFadeMs
+      : DISCOVERY_MESSAGE_TIMING.firstFadeInMs,
+    firstHoldMs: DISCOVERY_MESSAGE_TIMING.firstHoldMs,
+    firstFadeOutMs: reducedMotion
+      ? shortFadeOutMs
+      : DISCOVERY_MESSAGE_TIMING.firstFadeOutMs,
+    secondFadeInMs: reducedMotion
+      ? shortFadeMs
+      : DISCOVERY_MESSAGE_TIMING.secondFadeInMs,
+    secondHoldMs: DISCOVERY_MESSAGE_TIMING.secondHoldMs,
+    secondFadeOutMs: reducedMotion
+      ? shortFadeOutMs
+      : DISCOVERY_MESSAGE_TIMING.secondFadeOutMs,
+    milestoneFadeInMs: reducedMotion
+      ? shortFadeMs
+      : MILESTONE_MESSAGE_TIMING.fadeInMs,
+    milestoneHoldMs: MILESTONE_MESSAGE_TIMING.holdMs,
+    milestoneFadeOutMs: reducedMotion
+      ? shortFadeOutMs
+      : MILESTONE_MESSAGE_TIMING.fadeOutMs,
+  };
+}
+
+function getDiscoveryPhaseDurationMs(fadeInMs, holdMs, fadeOutMs) {
+  return Math.max(0, fadeInMs) + Math.max(0, holdMs) + Math.max(0, fadeOutMs);
+}
+
+function isDiscoveryNotificationActive() {
+  return discoveryNotificationState.phase !== "idle";
+}
+
+function clearDiscoveryNotificationTimer() {
+  if (discoveryNotificationState.timerId != null) {
+    clearTimeout(discoveryNotificationState.timerId);
+    discoveryNotificationState.timerId = null;
+  }
+}
+
+function hideDiscoveryMessage() {
+  const message = el("discovery-message");
+  if (!message) return;
+  message.classList.remove("is-visible");
+  message.classList.add("hidden");
+}
+
+function flushPendingToast() {
+  const pending = showToast._pending;
+  showToast._pending = null;
+  if (pending) showToast(pending.msg, pending.variant);
+}
+
+function clearDiscoveryNotification(options) {
+  const flushPending = !options || options.flushPendingToast !== false;
+  clearDiscoveryNotificationTimer();
+  discoveryNotificationState.token += 1;
+  discoveryNotificationState.phase = "idle";
+  discoveryNotificationState.sessionId = null;
+  discoveryNotificationState.latestCount = null;
+  discoveryNotificationState.milestoneThreshold = null;
+  discoveryNotificationState.phaseEndsAt = 0;
+  hideDiscoveryMessage();
+  if (flushPending) {
+    flushPendingToast();
+  } else {
+    showToast._pending = null;
+  }
+}
+
+function scheduleDiscoveryNotificationAction(delayMs, action) {
+  clearDiscoveryNotificationTimer();
+  const token = discoveryNotificationState.token;
+  discoveryNotificationState.timerId = setTimeout(() => {
+    discoveryNotificationState.timerId = null;
+    if (token !== discoveryNotificationState.token) return;
+    action();
+  }, Math.max(0, delayMs));
+}
+
+function getRemainingDiscoveryNotificationMs(now) {
+  if (!isDiscoveryNotificationActive()) return 0;
+  const timing = getDiscoveryMessageTiming(prefersReducedMotion());
+  const currentTime = Number.isFinite(now) ? now : Date.now();
+  const currentPhaseMs = Math.max(
+    0,
+    discoveryNotificationState.phaseEndsAt - currentTime,
+  );
+  const firstMs = getDiscoveryPhaseDurationMs(
+    timing.firstFadeInMs,
+    timing.firstHoldMs,
+    timing.firstFadeOutMs,
+  );
+  const secondMs =
+    discoveryNotificationState.latestCount == null
+      ? 0
+      : getDiscoveryPhaseDurationMs(
+          timing.secondFadeInMs,
+          timing.secondHoldMs,
+          timing.secondFadeOutMs,
+        );
+  const milestoneMs =
+    discoveryNotificationState.milestoneThreshold == null
+      ? 0
+      : getDiscoveryPhaseDurationMs(
+          timing.milestoneFadeInMs,
+          timing.milestoneHoldMs,
+          timing.milestoneFadeOutMs,
+        );
+
+  if (discoveryNotificationState.phase === "waiting") {
+    return currentPhaseMs + firstMs + milestoneMs + secondMs;
+  }
+  if (discoveryNotificationState.phase === "first") {
+    return currentPhaseMs + milestoneMs + secondMs;
+  }
+  if (discoveryNotificationState.phase === "milestone") {
+    return currentPhaseMs + secondMs;
+  }
+  return currentPhaseMs;
+}
+
+function refreshDiscoveryFeedbackDeadline() {
+  const sessionId = discoveryNotificationState.sessionId;
+  if (
+    sessionId == null ||
+    adventureState.status !== "active" ||
+    adventureState.sessionId !== sessionId
+  ) {
+    return;
+  }
+  adventureState.discoveryFeedbackUntil = Math.max(
+    adventureState.discoveryFeedbackUntil,
+    Date.now() + getRemainingDiscoveryNotificationMs(),
+  );
+}
+
+function runDiscoveryMessagePhase({
+  phase,
+  text,
+  variant,
+  fadeInMs,
+  holdMs,
+  fadeOutMs,
+  onComplete,
+}) {
+  clearDiscoveryNotificationTimer();
+  discoveryNotificationState.phase = phase;
+  discoveryNotificationState.phaseEndsAt =
+    Date.now() + getDiscoveryPhaseDurationMs(fadeInMs, holdMs, fadeOutMs);
+
+  const message = el("discovery-message");
+  if (message) {
+    message.classList.remove(
+      "hidden",
+      "is-visible",
+      "discovery-primary",
+      "discovery-secondary",
+      "discovery-milestone",
+    );
+    message.classList.add(`discovery-${variant}`);
+    message.style.setProperty("--discovery-transition-ms", `${fadeInMs}ms`);
+    message.textContent = text;
+    // 初期opacityを確定してから表示クラスを付け、短いフェードを確実に開始する。
+    void message.offsetWidth;
+    message.classList.add("is-visible");
+  }
+
+  refreshDiscoveryFeedbackDeadline();
+  scheduleDiscoveryNotificationAction(fadeInMs + holdMs, () => {
+    if (message) {
+      message.style.setProperty("--discovery-transition-ms", `${fadeOutMs}ms`);
+      message.classList.remove("is-visible");
+    }
+    scheduleDiscoveryNotificationAction(fadeOutMs, () => {
+      if (message) message.classList.add("hidden");
+      onComplete();
+    });
+  });
+}
+
+function finishDiscoveryNotification() {
+  clearDiscoveryNotification({ flushPendingToast: true });
+}
+
+function startSecondDiscoveryMessage() {
+  const count = discoveryNotificationState.latestCount;
+  if (count == null) {
+    finishDiscoveryNotification();
+    return;
+  }
+  const timing = getDiscoveryMessageTiming(prefersReducedMotion());
+  runDiscoveryMessagePhase({
+    phase: "second",
+    text: `今日の発見 ${count}`,
+    variant: "secondary",
+    fadeInMs: timing.secondFadeInMs,
+    holdMs: timing.secondHoldMs,
+    fadeOutMs: timing.secondFadeOutMs,
+    onComplete: finishDiscoveryNotification,
+  });
+}
+
+function startMilestoneDiscoveryMessage(threshold) {
+  discoveryNotificationState.milestoneThreshold = null;
+  const timing = getDiscoveryMessageTiming(prefersReducedMotion());
+  const text = showMilestoneCelebration(threshold, { showToast: false });
+  runDiscoveryMessagePhase({
+    phase: "milestone",
+    text,
+    variant: "milestone",
+    fadeInMs: timing.milestoneFadeInMs,
+    holdMs: timing.milestoneHoldMs,
+    fadeOutMs: timing.milestoneFadeOutMs,
+    onComplete: startSecondDiscoveryMessage,
+  });
+}
+
+function continueDiscoveryMessageAfterFirst() {
+  const threshold = discoveryNotificationState.milestoneThreshold;
+  if (threshold != null) {
+    startMilestoneDiscoveryMessage(threshold);
+  } else {
+    startSecondDiscoveryMessage();
+  }
+}
+
+function startFirstDiscoveryMessage() {
+  const timing = getDiscoveryMessageTiming(prefersReducedMotion());
+  runDiscoveryMessagePhase({
+    phase: "first",
+    text: "新しい場所を発見！",
+    variant: "primary",
+    fadeInMs: timing.firstFadeInMs,
+    holdMs: timing.firstHoldMs,
+    fadeOutMs: timing.firstFadeOutMs,
+    onComplete: continueDiscoveryMessageAfterFirst,
+  });
+}
+
+function queueDiscoveryNotification({
+  sessionId,
+  sessionDiscoveryCount,
+  milestoneThreshold,
+}) {
+  const sameSequence =
+    isDiscoveryNotificationActive() &&
+    discoveryNotificationState.sessionId === sessionId;
+
+  if (sameSequence) {
+    if (sessionDiscoveryCount != null) {
+      discoveryNotificationState.latestCount = sessionDiscoveryCount;
+    }
+    if (milestoneThreshold != null) {
+      discoveryNotificationState.milestoneThreshold = milestoneThreshold;
+    }
+
+    // 第2表示中の新規発見は最新値で短く再開する。節目は先に差し込む。
+    if (
+      discoveryNotificationState.phase === "second" &&
+      discoveryNotificationState.milestoneThreshold != null
+    ) {
+      startMilestoneDiscoveryMessage(
+        discoveryNotificationState.milestoneThreshold,
+      );
+    } else if (discoveryNotificationState.phase === "second") {
+      startSecondDiscoveryMessage();
+    } else if (
+      discoveryNotificationState.phase === "milestone" &&
+      discoveryNotificationState.milestoneThreshold != null
+    ) {
+      // 連続して節目を越えても配列へ積まず、最新の節目だけへ更新する。
+      startMilestoneDiscoveryMessage(
+        discoveryNotificationState.milestoneThreshold,
+      );
+    } else {
+      refreshDiscoveryFeedbackDeadline();
+    }
+    return;
+  }
+
+  clearDiscoveryNotification({ flushPendingToast: false });
+  discoveryNotificationState.sessionId = sessionId;
+  discoveryNotificationState.latestCount = sessionDiscoveryCount;
+  discoveryNotificationState.milestoneThreshold = milestoneThreshold;
+  discoveryNotificationState.phase = "waiting";
+  const fogDelayMs = prefersReducedMotion()
+    ? 0
+    : CELL_FOG_CONFIG.revealDurationMs;
+  discoveryNotificationState.phaseEndsAt = Date.now() + fogDelayMs;
+
+  const toast = el("toast");
+  if (toast) {
+    clearTimeout(showToast._timer);
+    toast.classList.add("hidden");
+  }
+  refreshDiscoveryFeedbackDeadline();
+  scheduleDiscoveryNotificationAction(fogDelayMs, startFirstDiscoveryMessage);
+}
+
+function handleCellDiscoveryFeedback(ix, iy, milestoneThreshold) {
+  // どの未踏セルへ入っても同じ処理・同じ価値。霧晴れを必ず最初の視覚演出にする。
+  clearConfettiLayer();
   revealFogCell(ix, iy);
   logCellFogDebug("cell-discovered", {
     currentCellId: cellKey(ix, iy),
@@ -1783,7 +2656,6 @@ function handleCellDiscoveryFeedback(ix, iy) {
   });
 
   drawVisitedCell(ix, iy, { animate: true });
-  showToast("新しい場所を発見！");
   pushLog("cell", `セル開放 (${ix},${iy})`);
 
   try {
@@ -1792,23 +2664,26 @@ function handleCellDiscoveryFeedback(ix, iy) {
     // 振動非対応・失敗しても本体は継続する
   }
 
-  if (adventureState.status === "active") {
-    adventureState.discoveredCells++;
-    const alreadyTracked = adventureState.sessionDiscoveredCellIds.some(
-      (c) => c.ix === ix && c.iy === iy,
-    );
-    if (!alreadyTracked) {
-      adventureState.sessionDiscoveredCellIds.push({ ix, iy });
-    }
-    renderAdventureHud();
-    if (
-      !adventureState.targetReached &&
-      adventureState.discoveredCells >= adventureState.targetCells
-    ) {
-      adventureState.targetReached = true;
-      setTimeout(() => showToast("今日の冒険を達成しました！"), 900);
-    }
+  const adventureSessionId =
+    adventureState.status === "active" ? adventureState.sessionId : null;
+  const discoveryRegistered = registerAdventureDiscovery(ix, iy);
+  const sessionDiscoveryCount =
+    adventureSessionId != null && discoveryRegistered
+      ? adventureState.sessionDiscoveredCellIds.size
+      : null;
+
+  queueDiscoveryNotification({
+    sessionId: adventureSessionId,
+    sessionDiscoveryCount,
+    milestoneThreshold,
+  });
+  if (adventureSessionId != null) {
+    deferVisibleTimeGoalForDiscovery();
   }
+
+  logTimeGoalDebug("cell-discovered", { discoveryTriggered: true });
+  // 発見と達成時刻が重なった場合、この時点で記録した優先期限を時間達成側が尊重する。
+  updateAdventureTime();
 }
 
 /* ---------- 発見数の節目 ---------- */
@@ -1819,61 +2694,257 @@ function checkMilestones() {
     const newlyReached = MILESTONE_THRESHOLDS.filter(
       (t) => total >= t && !displayed.includes(t),
     );
-    if (newlyReached.length === 0) return;
+    if (newlyReached.length === 0) return null;
     const toCelebrate = newlyReached[newlyReached.length - 1];
     store.set(STORAGE_KEYS.milestones, [...displayed, ...newlyReached]);
-    showMilestoneCelebration(toCelebrate);
+    return toCelebrate;
   } catch (e) {
     // 節目演出に失敗してもアプリ本体は継続する
+    return null;
   }
 }
 
-function showMilestoneCelebration(threshold) {
+function showMilestoneCelebration(threshold, options) {
   const msg = MILESTONE_MESSAGES[threshold] || "新しい節目に到達しました。";
-  showToast(msg, "milestone");
+  if (!options || options.showToast !== false) showToast(msg, "milestone");
   pushLog("milestone", msg);
   try {
     spawnConfetti();
   } catch (e) {
     // 紙吹雪の失敗は無視して継続する
   }
+  return msg;
 }
 
-function spawnConfetti() {
+function clearConfettiLayer() {
+  const layer = el("confetti-layer");
+  if (layer) layer.replaceChildren();
+}
+
+function spawnConfetti(options) {
   if (prefersReducedMotion()) return;
   const layer = el("confetti-layer");
   if (!layer) return;
+  const intensity = options && options.intensity ? options.intensity : "medium";
+  const durationMs =
+    options && Number.isFinite(options.durationMs) ? options.durationMs : 1400;
   const colors = ["#f59e0b", "#fbbf24", "#facc15", "#e5e7eb", "#60a5fa"];
-  const count = 18;
+  const count = CONFETTI_PIECE_COUNTS[intensity] || CONFETTI_PIECE_COUNTS.medium;
   for (let i = 0; i < count; i++) {
     const piece = document.createElement("span");
     piece.className = "confetti-piece";
     piece.style.left = `${Math.random() * 100}%`;
     piece.style.background = colors[i % colors.length];
     piece.style.animationDelay = `${Math.random() * 150}ms`;
+    piece.style.animationDuration = `${durationMs}ms`;
     piece.style.setProperty("--drift", `${(Math.random() - 0.5) * 120}px`);
     piece.style.setProperty("--rot", `${(Math.random() - 0.5) * 720}deg`);
     layer.appendChild(piece);
-    setTimeout(() => piece.remove(), 1500);
+    setTimeout(() => piece.remove(), durationMs + 300);
   }
+}
+
+/* ---------- 今日歩いた形（ルート形状） ----------
+   冒険中に記録したGPS軌跡(adventureState.routePoints)を、地図タイル・地名・現在地を
+   一切使わずに抽象的な線として描く。実際の緯度経度は表示せず、形だけを残す。
+   ========================================================== */
+
+// 緯度経度を、原点(origin)からの相対メートル座標へ変換する（既存のtoMeters()を再利用）。
+// 実際の地図位置とは無関係な「形」だけを残すため、画面はy(北)を上にして反転する。
+function projectRoutePoints(points) {
+  return points.map((p) => {
+    const m = toMeters(p.lat, p.lon);
+    return { x: m.x, y: -m.y };
+  });
+}
+
+// 共有カードなど将来の再利用向けに、回転・左右反転だけを分離した純粋関数にしておく。
+// 通常の終了画面ではrotationSteps=0, flipX=false（実際の向きのまま）で呼ぶ。
+function rotateRoutePoints(points, rotationSteps, flipX) {
+  let result = points;
+  const steps = ((rotationSteps % 4) + 4) % 4;
+  for (let i = 0; i < steps; i++) {
+    result = result.map((p) => ({ x: -p.y, y: p.x })); // 時計回りに90度
+  }
+  if (flipX) {
+    result = result.map((p) => ({ x: -p.x, y: p.y }));
+  }
+  return result;
+}
+
+// ルート全体をviewBox内へアスペクト比を保ったまま収める。幅・高さがほぼ0(直線・ほぼ同一点)
+// でもゼロ除算しないよう、スパンが実質0の軸は拡大率の計算から除外する。
+function fitRoutePointsToViewBox(points, viewBox) {
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const spanX = maxX - minX;
+  const spanY = maxY - minY;
+  const availableW = viewBox.width - viewBox.padding * 2;
+  const availableH = viewBox.height - viewBox.padding * 2;
+
+  const scaleCandidates = [];
+  if (spanX > ROUTE_SHAPE_MIN_SPAN_M) scaleCandidates.push(availableW / spanX);
+  if (spanY > ROUTE_SHAPE_MIN_SPAN_M) scaleCandidates.push(availableH / spanY);
+  const scale = scaleCandidates.length > 0 ? Math.min(...scaleCandidates) : 1;
+
+  const scaledW = spanX * scale;
+  const scaledH = spanY * scale;
+  const offsetX = viewBox.padding + (availableW - scaledW) / 2;
+  const offsetY = viewBox.padding + (availableH - scaledH) / 2;
+
+  return {
+    points: points.map((p) => ({
+      x: offsetX + (p.x - minX) * scale,
+      y: offsetY + (p.y - minY) * scale,
+    })),
+    scale,
+    bounds: { minX, maxX, minY, maxY, spanX, spanY },
+  };
+}
+
+function buildRoutePathData(points) {
+  if (!points || points.length < 2) return "";
+  return points
+    .map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)} ${p.y.toFixed(1)}`)
+    .join(" ");
+}
+
+// 記録済みのルート点から、そのまま描画できる状態まで組み立てる。
+// 有効点が2未満の場合は、呼び出し側でルート枠自体を非表示にする。
+function getRouteShapeRenderData() {
+  const rawCount = adventureState.routePoints.length;
+  const validPoints = adventureState.routePoints.filter(
+    (p) => Number.isFinite(p.lat) && Number.isFinite(p.lon),
+  );
+  if (validPoints.length < 2) {
+    return {
+      visible: false,
+      pathData: "",
+      rawPointCount: rawCount,
+      validPointCount: validPoints.length,
+      bounds: null,
+      scale: null,
+    };
+  }
+
+  const relativePoints = projectRoutePoints(validPoints);
+  const orientedPoints = rotateRoutePoints(relativePoints, 0, false); // 通常表示は実際の向きのまま
+  const fitted = fitRoutePointsToViewBox(orientedPoints, ROUTE_SHAPE_VIEWBOX);
+  return {
+    visible: true,
+    pathData: buildRoutePathData(fitted.points),
+    rawPointCount: rawCount,
+    validPointCount: validPoints.length,
+    bounds: fitted.bounds,
+    scale: fitted.scale,
+  };
+}
+
+function logRouteShapeDebug(renderData, renderedPathLength) {
+  if (!DEBUG_ROUTE_SHAPE) return;
+  const lastPoint = adventureState.lastRoutePoint;
+  console.log("[route-shape]", {
+    rawRoutePointCount: renderData.rawPointCount,
+    validRoutePointCount: renderData.validPointCount,
+    simplifiedRoutePointCount: renderData.validPointCount, // 現状は記録間隔による間引きのみ
+    routeDistanceM: lastPoint ? lastPoint.cumulativeDistanceM : 0,
+    bounds: renderData.bounds,
+    scale: renderData.scale,
+    renderedPathLength,
+    routeShapeVisible: renderData.visible,
+  });
+}
+
+// 終了画面の「今日歩いた形」を描画する。歩いた順に線が描かれるアニメーション付き。
+// reduced-motionの場合は即時表示（フェードや拡大縮小は追加しない）。
+function renderRouteShape() {
+  const section = el("adventure-route-summary");
+  const svg = el("adventure-route-shape");
+  const path = el("adventure-route-path");
+  if (!section || !svg || !path) return;
+
+  const renderData = getRouteShapeRenderData();
+  section.classList.toggle("hidden", !renderData.visible);
+
+  if (!renderData.visible) {
+    path.removeAttribute("d");
+    path.style.transition = "none";
+    path.style.strokeDasharray = "";
+    path.style.strokeDashoffset = "";
+    logRouteShapeDebug(renderData, 0);
+    return;
+  }
+
+  // 多重アニメーション防止: 前回分のtransitionを一旦切ってから新しい形状・状態を設定する。
+  path.style.transition = "none";
+  path.setAttribute("d", renderData.pathData);
+
+  const length = typeof path.getTotalLength === "function" ? path.getTotalLength() : 0;
+  const reducedMotion = prefersReducedMotion();
+
+  if (reducedMotion || !(length > 0)) {
+    path.style.strokeDasharray = "";
+    path.style.strokeDashoffset = "0";
+  } else {
+    path.style.strokeDasharray = `${length}`;
+    path.style.strokeDashoffset = `${length}`;
+    requestAnimationFrame(() => {
+      path.style.transition = `stroke-dashoffset ${ROUTE_SHAPE_DRAW_DURATION_MS}ms ease-out`;
+      path.style.strokeDashoffset = "0";
+    });
+  }
+
+  logRouteShapeDebug(renderData, length);
 }
 
 /* ---------- 冒険完了シート ---------- */
 let lastCompletionMessage = ""; // 成果カードでも同じ一行メッセージを使い回すため保持
 
-function showCompletionSheet() {
+function getAdventureCompletionData() {
   const preset = adventureState.preset
     ? ADVENTURE_PRESETS[adventureState.preset]
     : null;
-  el("completion-duration").textContent = preset ? `${preset.minutes}分` : "--";
-  el("completion-direction").textContent = adventureState.direction
-    ? adventureState.direction.label
-    : "--";
-  el("completion-session-cells").textContent =
-    `${adventureState.discoveredCells}`;
-  el("completion-total-cells").textContent = `${Object.keys(visited).length}`;
-  lastCompletionMessage =
-    COMPLETION_MESSAGES[Math.floor(Math.random() * COMPLETION_MESSAGES.length)];
+  return {
+    actualDurationMs: adventureState.elapsedAdventureMs,
+    distanceMeters: adventureState.distanceMeters,
+    visitedCellCount: adventureState.sessionVisitedCellIds.size,
+    discoveredCellCount: adventureState.sessionDiscoveredCellIds.size,
+    startedAt: adventureState.startedAt,
+    endedAt: adventureState.endedAt,
+    selectedPresetMinutes: preset ? preset.minutes : null,
+    extensionCount: adventureState.extensionCount,
+    initialGoalReached: adventureState.initialGoalReached,
+    direction: adventureState.direction ? { ...adventureState.direction } : null,
+  };
+}
+
+function getAdventureEndMessage(discoveredCellCount) {
+  return discoveredCellCount > 0
+    ? ADVENTURE_END_MESSAGES.withDiscovery
+    : ADVENTURE_END_MESSAGES.noDiscovery;
+}
+
+function showCompletionSheet(completionData) {
+  const data = completionData || getAdventureCompletionData();
+  el("completion-title").textContent = "今日の冒険、おつかれさま！";
+  try {
+    renderRouteShape();
+  } catch (e) {
+    // ルート形状の描画に失敗しても、終了画面本体(数値・メッセージ)は表示を継続する。
+    console.error("renderRouteShape failed", e);
+  }
+  el("completion-elapsed").textContent = formatAdventureMinutes(
+    data.actualDurationMs,
+  );
+  el("completion-distance").textContent = formatAdventureDistance(
+    data.distanceMeters,
+  );
+  el("completion-discovered-cells").textContent = `${data.discoveredCellCount}`;
+  lastCompletionMessage = getAdventureEndMessage(data.discoveredCellCount);
   el("completion-message").textContent = lastCompletionMessage;
   const firstBtn = el("completion-sheet").querySelector("button");
   if (firstBtn) firstBtn.focus();
@@ -1923,6 +2994,7 @@ const FOCUS_TRAP_CONTAINER_IDS = [
   "night-warning-panel",
   "duration-panel",
   "direction-panel",
+  "time-goal-panel",
   "completion-sheet",
 ];
 let shareCardReturnFocusEl = null;
@@ -2066,7 +3138,7 @@ function renderShapeGrid(container, cellIds) {
 /* ---------- Priority 2 + 4: 冒険成果カード ---------- */
 function showAchievementCard() {
   el("achievement-cell-count").textContent =
-    `${adventureState.sessionDiscoveredCellIds.length}`;
+    `${adventureState.sessionDiscoveredCellIds.size}`;
   const preset = adventureState.preset
     ? ADVENTURE_PRESETS[adventureState.preset]
     : null;
@@ -2092,7 +3164,7 @@ function showAchievementCard() {
   try {
     renderShapeGrid(
       el("achievement-shape-grid"),
-      adventureState.sessionDiscoveredCellIds,
+      adventureState.sessionDiscoveredCells,
     );
   } catch (e) {
     // シルエット描画に失敗してもカード自体は表示する
@@ -2103,6 +3175,8 @@ function showAchievementCard() {
 
 /* ---------- 位置情報の処理 ---------- */
 let lastAccuracyWarnAt = 0;
+let lastReliablePosition = null;
+let lastReliableCellId = null;
 
 function handlePosition(pos) {
   const { latitude: lat, longitude: lon, accuracy } = pos.coords;
@@ -2147,12 +3221,26 @@ function handlePosition(pos) {
   if (reliable) {
     const { ix, iy } = cellIndex(lat, lon);
     const key = cellKey(ix, iy);
+    const positionTimestamp = Number.isFinite(pos.timestamp)
+      ? pos.timestamp
+      : Date.now();
+    lastReliablePosition = { lat, lon, timestamp: positionTimestamp };
+    lastReliableCellId = key;
+    adventureState.currentCellId = key;
+
+    if (adventureState.status === "active") {
+      registerAdventureDistance(lat, lon, positionTimestamp, accuracy);
+      registerAdventureVisitedCell(ix, iy);
+      recordRoutePoint(lat, lon, positionTimestamp, accuracy);
+    }
 
     if (!visited[key]) {
       visited[key] = { ts: Date.now(), lat, lon };
       store.set(STORAGE_KEYS.visited, visited);
-      handleCellDiscoveryFeedback(ix, iy);
-      checkMilestones();
+      // 節目は先に記録だけ確定し、見た目はhandleCellDiscoveryFeedback内で
+      // 霧晴れ→通常発見→節目→コース達成の順に遅延表示する。
+      const milestoneThreshold = checkMilestones();
+      handleCellDiscoveryFeedback(ix, iy, milestoneThreshold);
     }
 
     if (quest && quest.ix === ix && quest.iy === iy) {
@@ -2167,6 +3255,8 @@ function handlePosition(pos) {
 
     updateFogCells(lat, lon); // 精度の粗い測位では霧の中心もずらさない（GPSノイズでの誤表示を避ける）
   }
+
+  updateAdventureTime();
 
   updateHud(lat, lon);
   updateFrontierCompassFlow(lat, lon, reliable);
@@ -2310,6 +3400,14 @@ window.addEventListener("DOMContentLoaded", () => {
   // ---- 冒険開始・終了 ----
   el("btn-begin-adventure").addEventListener("click", beginAdventureFlow);
   el("btn-end-adventure").addEventListener("click", endAdventure);
+  el("btn-time-goal-end").addEventListener("click", endAdventure);
+  el("btn-time-goal-extend").addEventListener(
+    "click",
+    extendAdventureFiveMinutes,
+  );
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") updateAdventureTime();
+  });
 
   // ---- 冒険完了シート ----
   el("btn-open-way-home").addEventListener("click", openWayHome);

@@ -118,11 +118,11 @@ test("night direction copy mentions familiar or safe/well-lit roads", () => {
   }
 });
 
-test("adventure preset target cell counts are unchanged (5min=2, 15min=5, 30min=8)", () => {
+test("night uses the same 5, 15, and 30 minute time goals as daytime", () => {
   assert.equal(nightMode.adventurePresets.short.minutes, 5);
-  assert.equal(nightMode.adventurePresets.short.targetCells, 2);
+  assert.equal(nightMode.adventurePresets.short.targetDurationMs, 5 * 60 * 1000);
   assert.equal(nightMode.adventurePresets.normal.minutes, 15);
-  assert.equal(nightMode.adventurePresets.normal.targetCells, 5);
+  assert.equal(nightMode.adventurePresets.normal.targetDurationMs, 15 * 60 * 1000);
   assert.equal(nightMode.adventurePresets.long.minutes, 30);
-  assert.equal(nightMode.adventurePresets.long.targetCells, 8);
+  assert.equal(nightMode.adventurePresets.long.targetDurationMs, 30 * 60 * 1000);
 });

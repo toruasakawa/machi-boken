@@ -274,6 +274,11 @@ body {
   border-radius: 12px;
   font-weight: 700;
   font-size: 14px;
+  line-height: 1.45;
+  text-align: center;
+  white-space: pre-line;
+  width: max-content;
+  max-width: calc(100vw - 32px);
   z-index: 40;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
   transition:
@@ -284,6 +289,50 @@ body {
   opacity: 0;
   transform: translate(-50%, 12px);
   pointer-events: none;
+}
+
+/* 発見通知は地図操作を塞がず、主表示と記録表示の強弱を分ける。 */
+#discovery-message {
+  position: fixed;
+  left: 50%;
+  bottom: max(24px, env(safe-area-inset-bottom));
+  z-index: 42;
+  width: max-content;
+  max-width: calc(100vw - 32px);
+  padding: 13px 22px;
+  border-radius: 12px;
+  background: var(--amber);
+  color: #111827;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  line-height: 1.45;
+  text-align: center;
+  pointer-events: none;
+  opacity: 0;
+  transform: translate(-50%, 8px) scale(0.98);
+  transition:
+    opacity var(--discovery-transition-ms, 150ms) ease,
+    transform var(--discovery-transition-ms, 150ms) ease;
+}
+#discovery-message.is-visible {
+  opacity: 1;
+  transform: translate(-50%, 0) scale(1);
+}
+#discovery-message.hidden {
+  display: none;
+}
+#discovery-message.discovery-primary {
+  font-size: 18px;
+  font-weight: 800;
+}
+#discovery-message.discovery-secondary {
+  font-size: 14px;
+  font-weight: 650;
+}
+#discovery-message.discovery-milestone {
+  padding: 16px 26px;
+  font-size: 16px;
+  font-weight: 800;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
 }
 
 /* フロンティア・コンパス */
@@ -366,6 +415,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
   font-size: 13px;
 }
 .adventure-hud-direction {
@@ -374,6 +425,7 @@ body {
 }
 .adventure-hud-progress {
   color: var(--text-dim);
+  text-align: right;
 }
 .adventure-end-btn {
   align-self: flex-end;
@@ -383,6 +435,49 @@ body {
   background: transparent;
   color: var(--text);
   font-size: 12px;
+}
+
+/* 時間達成は地図と霧晴れを隠さない、軽いフローティング通知として表示する。 */
+#time-goal-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 35;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  pointer-events: auto;
+}
+#time-goal-panel.hidden {
+  display: none;
+}
+.time-goal-card {
+  width: min(340px, 100%);
+  padding: 20px;
+  border: 1px solid var(--amber-dim);
+  border-radius: var(--radius);
+  background: rgba(17, 24, 39, 0.96);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.45);
+  text-align: center;
+  pointer-events: auto;
+}
+.time-goal-card h2 {
+  margin: 0 0 8px;
+  color: var(--amber);
+  font-size: 20px;
+}
+.time-goal-card p {
+  margin: 0 0 18px;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+.time-goal-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.time-goal-actions button {
+  width: 100%;
 }
 
 /* 夜間セーフティ警告 */
@@ -609,6 +704,32 @@ body {
   color: var(--amber);
   font-size: 13px;
   font-weight: 700;
+}
+
+/* 冒険完了シート: 今日歩いた形（ルート形状。地図タイルは使わず線だけを見せる） */
+.adventure-route-summary {
+  margin: 2px 0 12px;
+}
+.adventure-route-summary.hidden {
+  display: none;
+}
+.adventure-route-heading {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.adventure-route-shape {
+  display: block;
+  width: 100%;
+  height: 150px;
+}
+.adventure-route-path {
+  fill: none;
+  stroke: var(--amber);
+  stroke-width: 5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 /* 冒険完了シート */
@@ -935,6 +1056,10 @@ body {
   .map-cell-explored.is-revealing {
     animation-duration: 150ms;
     animation-delay: 0ms;
+  }
+  #discovery-message,
+  #discovery-message.is-visible {
+    transform: translate(-50%, 0);
   }
 }
 

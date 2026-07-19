@@ -46,17 +46,23 @@
   <button id="btn-end-adventure" class="adventure-end-btn" type="button">冒険を終える</button>
 </div>
 
-<!-- 時間達成後も冒険を継続したまま、終了または5分延長を選べる軽い通知 -->
-<div id="time-goal-panel" class="time-goal-panel hidden" role="dialog" aria-modal="true" aria-labelledby="time-goal-title" aria-describedby="time-goal-sub">
-  <div class="time-goal-card">
-    <h2 id="time-goal-title">今日の冒険を達成しました！</h2>
-    <p id="time-goal-sub">このまま続けても大丈夫。</p>
-    <div class="time-goal-actions">
-      <button id="btn-time-goal-end" class="btn-primary" type="button">冒険を終える</button>
-      <button id="btn-time-goal-extend" class="btn-secondary" type="button">あと5分だけ続ける</button>
-    </div>
-  </div>
-</div>
+<!-- 初期時間の達成は操作を求めず、発見演出の後に短く知らせる -->
+<div
+  id="time-goal-notification"
+  class="time-goal-notification hidden"
+  role="status"
+  aria-live="polite"
+  aria-atomic="true"
+>今日の冒険を達成しました！</div>
+
+<!-- 勾配スポット到達。フォーカスは移さず、発見通知・時間達成通知と同じ簡易通知として表示する -->
+<div
+  id="slope-quest-notification"
+  class="slope-quest-notification hidden"
+  role="status"
+  aria-live="polite"
+  aria-atomic="true"
+></div>
 
 <!-- 位置情報許可前のオーバーレイ -->
 <div id="permission-screen">
@@ -148,6 +154,10 @@
     <li><span class="completion-label">歩いた距離</span><span id="completion-distance"></span></li>
     <li><span class="completion-label">新しい場所</span><span id="completion-discovered-cells"></span></li>
   </ul>
+  <div id="slope-quest-result-badge" class="result-achievement-badge" hidden>
+    <span aria-hidden="true">✓</span>
+    <span>勾配スポットに到達</span>
+  </div>
   <p id="completion-message" class="completion-message"></p>
   <button id="btn-show-achievement-card" class="share-trigger-btn" type="button">成果カードを見る</button>
   <div class="completion-actions">
@@ -198,8 +208,12 @@
       <button id="btn-privacy-ack" type="button">OK</button>
     </div>
 
-    <p class="achievement-shape-caption">今日歩いた形</p>
-    <div id="achievement-shape-grid" class="achievement-shape-grid" aria-hidden="true"></div>
+    <section id="achievement-route-summary" class="achievement-route-summary hidden">
+      <p class="achievement-shape-caption">今日歩いた形</p>
+      <svg id="achievement-route-shape" class="adventure-route-shape achievement-route-shape" viewBox="0 0 320 170" role="img" aria-label="今日歩いたルートの形">
+        <path id="achievement-route-path" class="adventure-route-path"></path>
+      </svg>
+    </section>
 
     <p id="achievement-message" class="share-card-headline"></p>
     <p class="share-card-tagline">知らない道を、正解にする。</p>

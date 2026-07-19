@@ -9,36 +9,60 @@ function loadProductionAdventure() {
   const source = readFileSync(appPath, "utf8");
   const scheduled = [];
   let nextTimerId = 1;
+  const timeGoalClasses = new Set(["hidden"]);
+  const timeGoalNotification = {
+    classList: {
+      add: (...names) => names.forEach((name) => timeGoalClasses.add(name)),
+      remove: (...names) => names.forEach((name) => timeGoalClasses.delete(name)),
+      contains: (name) => timeGoalClasses.has(name),
+    },
+    offsetWidth: 0,
+    style: { setProperty: () => {} },
+    textContent: "",
+  };
+  const documentMock = {
+    activeElement: null,
+    visibilityState: "visible",
+    getElementById: (id) =>
+      id === "time-goal-notification" ? timeGoalNotification : null,
+  };
   const exposeTestHooks = `
     globalThis.__adventureTestHooks = {
       adventureState,
       adventurePresets: ADVENTURE_PRESETS,
-      adventureExtensionMs: ADVENTURE_EXTENSION_MS,
       timeGoalCompletionEffect: TIME_GOAL_COMPLETION_EFFECT,
+      timeGoalMessageTiming: TIME_GOAL_MESSAGE_TIMING,
       discoveryMessageTiming: DISCOVERY_MESSAGE_TIMING,
       milestoneMessageTiming: MILESTONE_MESSAGE_TIMING,
       cellFogConfig: CELL_FOG_CONFIG,
       adventureGoalMessage: ADVENTURE_GOAL_MESSAGE,
-      adventureGoalSubMessage: ADVENTURE_GOAL_SUB_MESSAGE,
-      adventureExtensionMessage: ADVENTURE_EXTENSION_MESSAGE,
       adventureEndMessages: ADVENTURE_END_MESSAGES,
       debugTimeGoal: DEBUG_TIME_GOAL,
-      shouldTriggerAdventureGoal,
+      shouldTriggerInitialAdventureGoal,
       getElapsedAdventureMs,
       getTimeGoalPresentationDelay,
+      getTimeGoalMessageTiming,
       getDiscoveryMessageTiming,
       getDiscoveryPhaseDurationMs,
       getAdventureProgressText,
       registerAdventureVisitedCell,
       registerAdventureDiscovery,
       registerAdventureDistance,
+      recordRoutePoint,
+      updateAdventureTime,
       triggerAdventureTimeGoal,
-      extendAdventureFiveMinutes,
+      handleAdventureVisibilityChange,
+      shouldSuppressTimeGoalConfettiForDiscovery,
       getAdventureCompletionData,
       getAdventureEndMessage,
       discoveryNotificationState,
       queueDiscoveryNotification,
       resetAdventureStateKeepHistory,
+      shouldSuppressSlopeQuestConfettiForDiscovery,
+      slopeQuestArrivalMessage: SLOPE_QUEST_ARRIVAL_MESSAGE,
+      slopeQuestLabel: SLOPE_QUEST_LABEL,
+      slopeQuestConfetti: SLOPE_QUEST_CONFETTI,
+      debugSlopeQuest: DEBUG_SLOPE_QUEST,
     };
   `;
 
@@ -55,10 +79,7 @@ function loadProductionAdventure() {
       if (timer) timer.cleared = true;
     },
     console,
-    document: {
-      activeElement: null,
-      getElementById: () => null,
-    },
+    document: documentMock,
     fetch: async () => {
       throw new Error("Network access is disabled in this test");
     },
@@ -83,7 +104,12 @@ function loadProductionAdventure() {
   });
 
   vm.runInContext(`${source}\n${exposeTestHooks}`, context, { filename: appPath });
-  return { hooks: context.__adventureTestHooks, scheduled };
+  return {
+    hooks: context.__adventureTestHooks,
+    scheduled,
+    documentMock,
+    timeGoalNotification,
+  };
 }
 
 test("course presets use 5, 15, and 30 minute goals without cell targets", () => {
@@ -99,28 +125,28 @@ test("course presets use 5, 15, and 30 minute goals without cell targets", () =>
   }
 });
 
-test("time goal check triggers at the duration boundary only once", () => {
+test("initial time goal check triggers at the duration boundary only once", () => {
   const { hooks } = loadProductionAdventure();
   assert.equal(
-    hooks.shouldTriggerAdventureGoal({
+    hooks.shouldTriggerInitialAdventureGoal({
       elapsedAdventureMs: 5 * 60 * 1000 - 1,
-      targetDurationMs: 5 * 60 * 1000,
+      initialTargetDurationMs: 5 * 60 * 1000,
       goalReached: false,
     }),
     false,
   );
   assert.equal(
-    hooks.shouldTriggerAdventureGoal({
+    hooks.shouldTriggerInitialAdventureGoal({
       elapsedAdventureMs: 5 * 60 * 1000,
-      targetDurationMs: 5 * 60 * 1000,
+      initialTargetDurationMs: 5 * 60 * 1000,
       goalReached: false,
     }),
     true,
   );
   assert.equal(
-    hooks.shouldTriggerAdventureGoal({
-      elapsedAdventureMs: 6 * 60 * 1000,
-      targetDurationMs: 5 * 60 * 1000,
+    hooks.shouldTriggerInitialAdventureGoal({
+      elapsedAdventureMs: 15 * 60 * 1000,
+      initialTargetDurationMs: 5 * 60 * 1000,
       goalReached: true,
     }),
     false,
@@ -138,9 +164,18 @@ test("HUD shows elapsed time and unique visited cells without a denominator", ()
   const text = hooks.getAdventureProgressText({
     elapsedAdventureMs: 8 * 60 * 1000,
     sessionVisitedCellCount: 4,
+    goalReached: false,
   });
   assert.equal(text, "冒険中 8分 ・ 歩いた場所 4");
   assert.equal(text.includes("/"), false);
+  assert.equal(
+    hooks.getAdventureProgressText({
+      elapsedAdventureMs: 8 * 60 * 1000,
+      sessionVisitedCellCount: 5,
+      goalReached: true,
+    }),
+    "冒険達成 8分 ・ 歩いた場所 5",
+  );
 });
 
 test("start cell is excluded until the session leaves and returns", () => {
@@ -188,19 +223,102 @@ test("time completion sets flags synchronously and schedules once", () => {
     status: "active",
     preset: "short",
     elapsedAdventureMs: 5 * 60 * 1000,
-    targetDurationMs: 5 * 60 * 1000,
+    initialTargetDurationMs: 5 * 60 * 1000,
     goalReached: false,
-    initialGoalReached: false,
+    timeGoalNotificationPending: false,
     discoveryFeedbackUntil: 0,
     sessionId: 7,
   });
 
   assert.equal(hooks.triggerAdventureTimeGoal(), true);
   assert.equal(hooks.adventureState.goalReached, true);
-  assert.equal(hooks.adventureState.initialGoalReached, true);
+  assert.equal(hooks.adventureState.timeGoalNotificationPending, true);
+  assert.equal(hooks.adventureState.status, "active");
   assert.equal(scheduled.length, 1);
+  hooks.adventureState.elapsedAdventureMs = 10 * 60 * 1000;
+  assert.equal(hooks.triggerAdventureTimeGoal(), false);
+  hooks.adventureState.elapsedAdventureMs = 15 * 60 * 1000;
   assert.equal(hooks.triggerAdventureTimeGoal(), false);
   assert.equal(scheduled.length, 1);
+});
+
+test("background goal waits for visibility and presents exactly once after resume", () => {
+  const {
+    hooks,
+    scheduled,
+    documentMock,
+    timeGoalNotification,
+  } = loadProductionAdventure();
+  Object.assign(hooks.adventureState, {
+    status: "active",
+    startedAt: 1000,
+    elapsedAdventureMs: 0,
+    initialTargetDurationMs: 5 * 60 * 1000,
+    goalReached: false,
+    timeGoalNotificationPending: false,
+    timeGoalConfettiSuppressed: true,
+    discoveryFeedbackUntil: 0,
+    sessionId: 8,
+    direction: null,
+  });
+
+  documentMock.visibilityState = "hidden";
+  hooks.updateAdventureTime(301000);
+  hooks.adventureState.timeGoalConfettiSuppressed = true;
+  const hiddenAttempt = scheduled.find((item) => !item.cleared);
+  assert.ok(hiddenAttempt);
+  hiddenAttempt.cleared = true;
+  hiddenAttempt.callback();
+  assert.equal(hooks.adventureState.timeGoalNotificationPending, true);
+  assert.equal(timeGoalNotification.classList.contains("hidden"), true);
+
+  documentMock.visibilityState = "visible";
+  hooks.handleAdventureVisibilityChange();
+  const visibleAttempt = scheduled.find((item) => !item.cleared);
+  assert.ok(visibleAttempt);
+  visibleAttempt.cleared = true;
+  visibleAttempt.callback();
+  assert.equal(hooks.adventureState.timeGoalNotificationPending, false);
+  assert.equal(timeGoalNotification.classList.contains("is-visible"), true);
+  assert.equal(timeGoalNotification.textContent, "今日の冒険を達成しました！");
+
+  const fadeOutStart = scheduled.find((item) => !item.cleared);
+  assert.ok(fadeOutStart);
+  assert.equal(fadeOutStart.delayMs, 2350);
+  fadeOutStart.cleared = true;
+  fadeOutStart.callback();
+  const hide = scheduled.find((item) => !item.cleared);
+  assert.ok(hide);
+  assert.equal(hide.delayMs, 180);
+  hide.cleared = true;
+  hide.callback();
+  assert.equal(timeGoalNotification.classList.contains("hidden"), true);
+  assert.equal(hooks.triggerAdventureTimeGoal(), false);
+  assert.equal(scheduled.filter((item) => !item.cleared).length, 0);
+});
+
+test("a pending discovery milestone suppresses duplicate time-goal confetti", () => {
+  const { hooks } = loadProductionAdventure();
+  Object.assign(hooks.adventureState, {
+    status: "active",
+    elapsedAdventureMs: 5 * 60 * 1000,
+    initialTargetDurationMs: 5 * 60 * 1000,
+    goalReached: false,
+    timeGoalNotificationPending: false,
+    timeGoalConfettiSuppressed: false,
+    discoveryFeedbackUntil: Date.now() + 5000,
+    sessionId: 9,
+    direction: null,
+  });
+  Object.assign(hooks.discoveryNotificationState, {
+    phase: "first",
+    milestoneThreshold: 5,
+  });
+
+  assert.equal(hooks.shouldSuppressTimeGoalConfettiForDiscovery(), true);
+  assert.equal(hooks.triggerAdventureTimeGoal(), true);
+  assert.equal(hooks.adventureState.timeGoalConfettiSuppressed, true);
+  assert.equal(hooks.adventureState.status, "active");
 });
 
 test("discovery timing keeps both messages readable and delays the time goal", () => {
@@ -303,27 +421,40 @@ test("normal discovery advances from fog wait to first message and then latest c
   assert.equal(hooks.discoveryNotificationState.phase, "idle");
 });
 
-test("five minute extension preserves session results and only moves the time goal", () => {
+test("time, cells, discoveries, distance, and route recording continue after the goal", () => {
   const { hooks } = loadProductionAdventure();
   Object.assign(hooks.adventureState, {
     status: "active",
-    targetDurationMs: 5 * 60 * 1000,
+    startedAt: 1000,
+    elapsedAdventureMs: 5 * 60 * 1000,
+    initialTargetDurationMs: 5 * 60 * 1000,
     goalReached: true,
-    initialGoalReached: true,
-    extensionCount: 0,
-    sessionVisitedCellIds: new Set(["1_0", "2_0"]),
-    sessionDiscoveredCellIds: new Set(["2_0"]),
-    distanceMeters: 420,
+    direction: null,
+    startCellId: "0_0",
+    hasLeftStartCell: false,
+    sessionVisitedCellIds: new Set(),
+    sessionVisitedCells: [],
+    sessionDiscoveredCellIds: new Set(),
+    sessionDiscoveredCells: [],
+    distanceMeters: 0,
+    lastDistancePoint: { lat: 35, lon: 139, timestamp: 1000 },
+    routePoints: [],
+    lastRoutePoint: null,
   });
 
-  hooks.extendAdventureFiveMinutes();
-  assert.equal(hooks.adventureState.targetDurationMs, 10 * 60 * 1000);
-  assert.equal(hooks.adventureState.extensionCount, 1);
-  assert.equal(hooks.adventureState.goalReached, false);
-  assert.equal(hooks.adventureState.initialGoalReached, true);
-  assert.equal(hooks.adventureState.sessionVisitedCellIds.size, 2);
+  hooks.updateAdventureTime(13 * 60 * 1000 + 1000);
+  assert.equal(hooks.adventureState.elapsedAdventureMs, 13 * 60 * 1000);
+  assert.equal(hooks.adventureState.goalReached, true);
+  assert.equal(hooks.registerAdventureVisitedCell(1, 0), true);
+  assert.equal(hooks.registerAdventureDiscovery(1, 0), true);
+  assert.equal(hooks.registerAdventureDistance(35.0001, 139, 11000), true);
+  assert.equal(hooks.recordRoutePoint(35, 139, 1000, 10), true);
+  assert.equal(hooks.recordRoutePoint(35.0001, 139, 11000, 10), true);
+  assert.equal(hooks.adventureState.sessionVisitedCellIds.size, 1);
   assert.equal(hooks.adventureState.sessionDiscoveredCellIds.size, 1);
-  assert.equal(hooks.adventureState.distanceMeters, 420);
+  assert.ok(hooks.adventureState.distanceMeters > 0);
+  assert.equal(hooks.adventureState.routePoints.length, 2);
+  assert.equal(hooks.adventureState.status, "active");
 });
 
 test("distance accepts plausible movement and rejects a GPS jump", () => {
@@ -341,7 +472,7 @@ test("distance accepts plausible movement and rejects a GPS jump", () => {
   assert.equal(hooks.adventureState.distanceMeters, acceptedDistance);
 });
 
-test("completion data contains time, distance, cells, discoveries, and course metadata", () => {
+test("completion data uses actual duration and contains no extension count", () => {
   const { hooks } = loadProductionAdventure();
   Object.assign(hooks.adventureState, {
     preset: "normal",
@@ -351,8 +482,7 @@ test("completion data contains time, distance, cells, discoveries, and course me
     sessionDiscoveredCellIds: new Set(["3_0"]),
     startedAt: 1000,
     endedAt: 1081000,
-    extensionCount: 1,
-    initialGoalReached: true,
+    goalReached: true,
     direction: { sector: 0, label: "北", bearingDeg: 0 },
   });
 
@@ -367,14 +497,14 @@ test("completion data contains time, distance, cells, discoveries, and course me
       startedAt: 1000,
       endedAt: 1081000,
       selectedPresetMinutes: 15,
-      extensionCount: 1,
-      initialGoalReached: true,
+      goalReached: true,
+      slopeQuestCompleted: false,
       direction: { sector: 0, label: "北", bearingDeg: 0 },
     },
   );
 });
 
-test("time goal uses one light effect and production debug logging is disabled", () => {
+test("time goal uses one light effect, readable timing, and no extension copy", () => {
   const { hooks } = loadProductionAdventure();
   assert.deepEqual(
     JSON.parse(JSON.stringify(hooks.timeGoalCompletionEffect)),
@@ -382,8 +512,12 @@ test("time goal uses one light effect and production debug logging is disabled",
   );
   assert.equal(hooks.debugTimeGoal, false);
   assert.equal(hooks.adventureGoalMessage, "今日の冒険を達成しました！");
-  assert.equal(hooks.adventureGoalSubMessage, "このまま続けても大丈夫。");
-  assert.equal(hooks.adventureExtensionMessage, "追加の5分も歩きました。");
+  const timing = hooks.getTimeGoalMessageTiming(false);
+  const reducedTiming = hooks.getTimeGoalMessageTiming(true);
+  assert.equal(timing.fadeInMs + timing.holdMs + timing.fadeOutMs, 2530);
+  assert.equal(reducedTiming.holdMs, 2200);
+  assert.ok(reducedTiming.fadeInMs < timing.fadeInMs);
+  assert.ok(reducedTiming.fadeOutMs < timing.fadeOutMs);
 });
 
 test("ending early uses neutral, non-failure copy", () => {
@@ -414,16 +548,16 @@ test("session reset clears temporary time and cell state", () => {
   const { hooks } = loadProductionAdventure();
   Object.assign(hooks.adventureState, {
     goalReached: true,
-    initialGoalReached: true,
-    extensionCount: 2,
+    timeGoalNotificationPending: true,
+    timeGoalConfettiSuppressed: true,
     elapsedAdventureMs: 1234,
     sessionVisitedCellIds: new Set(["1_0"]),
     sessionDiscoveredCellIds: new Set(["1_0"]),
   });
   hooks.resetAdventureStateKeepHistory();
   assert.equal(hooks.adventureState.goalReached, false);
-  assert.equal(hooks.adventureState.initialGoalReached, false);
-  assert.equal(hooks.adventureState.extensionCount, 0);
+  assert.equal(hooks.adventureState.timeGoalNotificationPending, false);
+  assert.equal(hooks.adventureState.timeGoalConfettiSuppressed, false);
   assert.equal(hooks.adventureState.elapsedAdventureMs, 0);
   assert.equal(hooks.adventureState.sessionVisitedCellIds.size, 0);
   assert.equal(hooks.adventureState.sessionDiscoveredCellIds.size, 0);
@@ -433,9 +567,9 @@ test("completion HTML exposes only time, distance, and new-place results", () =>
   const html = readFileSync(join(__dirname, "..", "index.html"), "utf8");
   for (const required of [
     'id="adventure-hud-progress"',
-    'id="time-goal-panel"',
-    'id="btn-time-goal-end"',
-    'id="btn-time-goal-extend"',
+    'id="time-goal-notification"',
+    'aria-live="polite"',
+    'aria-atomic="true"',
     'id="completion-elapsed"',
     'id="completion-distance"',
     'id="completion-discovered-cells"',
@@ -443,7 +577,6 @@ test("completion HTML exposes only time, distance, and new-place results", () =>
     "今日の冒険、おつかれさま！",
     "新しい場所",
     "冒険を終える",
-    "あと5分だけ続ける",
   ]) {
     assert.equal(html.includes(required), true, `missing ${required}`);
   }
@@ -454,6 +587,11 @@ test("completion HTML exposes only time, distance, and new-place results", () =>
     "completion-course",
     "completion-extensions",
     "completion-direction",
+    "time-goal-panel",
+    "btn-time-goal-end",
+    "btn-time-goal-extend",
+    "あと5分だけ続ける",
+    "まだ冒険を続けますか",
   ]) {
     assert.equal(html.includes(removed), false, `obsolete ${removed}`);
   }
@@ -472,11 +610,163 @@ test("discovery notification cannot intercept map controls", () => {
   assert.equal(block[1].includes("pointer-events: none"), true);
   assert.equal(css.includes("#discovery-message.discovery-primary"), true);
   assert.equal(css.includes("#discovery-message.discovery-secondary"), true);
+
+  const timeGoalBlock = css.match(
+    /#time-goal-notification \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(timeGoalBlock);
+  assert.equal(timeGoalBlock[1].includes("pointer-events: none"), true);
+  assert.equal(timeGoalBlock[1].includes("inset: 0"), false);
+});
+
+test("only the persistent HUD end button is wired to end an active adventure", () => {
+  const app = readFileSync(join(__dirname, "..", "app.js"), "utf8");
+  const html = readFileSync(join(__dirname, "..", "index.html"), "utf8");
+  assert.equal(
+    (app.match(/addEventListener\("click", endAdventure\)/g) || []).length,
+    1,
+  );
+  assert.equal(html.includes('id="btn-end-adventure"'), true);
+  assert.equal(html.includes('role="dialog" aria-modal="true" aria-labelledby="time-goal'), false);
+});
+
+test("slope quest confetti is suppressed while a milestone is being shown (same rule as time goal)", () => {
+  const { hooks } = loadProductionAdventure();
+  Object.assign(hooks.discoveryNotificationState, {
+    phase: "milestone",
+    milestoneThreshold: 10,
+  });
+  assert.equal(hooks.shouldSuppressSlopeQuestConfettiForDiscovery(), true);
+
+  Object.assign(hooks.discoveryNotificationState, {
+    phase: "first",
+    milestoneThreshold: null,
+  });
+  assert.equal(hooks.shouldSuppressSlopeQuestConfettiForDiscovery(), false);
+});
+
+test("slope quest confetti stays at or below the time-goal intensity (never larger than a milestone)", () => {
+  const { hooks } = loadProductionAdventure();
+  assert.equal(hooks.slopeQuestConfetti.intensity, "small");
+  assert.ok(hooks.slopeQuestConfetti.durationMs >= 1000 && hooks.slopeQuestConfetti.durationMs <= 1300);
+});
+
+test("resetting the adventure clears slope quest completion and pending-notification flags", () => {
+  const { hooks } = loadProductionAdventure();
+  hooks.adventureState.status = "active";
+  hooks.adventureState.slopeQuestCompleted = true;
+  hooks.adventureState.slopeQuestNotificationPending = true;
+
+  hooks.resetAdventureStateKeepHistory();
+
+  assert.equal(hooks.adventureState.slopeQuestCompleted, false);
+  assert.equal(hooks.adventureState.slopeQuestNotificationPending, false);
+});
+
+test("completion data reports slopeQuestCompleted for both the reached and not-reached cases", () => {
+  const { hooks } = loadProductionAdventure();
+  Object.assign(hooks.adventureState, {
+    preset: "short",
+    elapsedAdventureMs: 5 * 60 * 1000,
+    distanceMeters: 300,
+    sessionVisitedCellIds: new Set(["0_0"]),
+    sessionDiscoveredCellIds: new Set(["0_0"]),
+    startedAt: 0,
+    endedAt: 300000,
+    goalReached: true,
+    slopeQuestCompleted: false,
+    direction: null,
+  });
+  assert.equal(hooks.getAdventureCompletionData().slopeQuestCompleted, false);
+
+  hooks.adventureState.slopeQuestCompleted = true;
+  assert.equal(hooks.getAdventureCompletionData().slopeQuestCompleted, true);
+});
+
+test("debug flag for the slope quest is off in production", () => {
+  const { hooks } = loadProductionAdventure();
+  assert.equal(hooks.debugSlopeQuest, false);
+});
+
+test("slope quest wording avoids absolute steepness claims and uses candidate phrasing", () => {
+  const app = readFileSync(join(__dirname, "..", "app.js"), "utf8");
+  const html = readFileSync(join(__dirname, "..", "index.html"), "utf8");
+  const forbidden = ["急勾配", "最も急な坂", "一番急な坂", "最大勾配", "最急地点"];
+  for (const phrase of forbidden) {
+    assert.equal(app.includes(phrase), false, `app.js must not contain "${phrase}"`);
+    assert.equal(html.includes(phrase), false, `index.html must not contain "${phrase}"`);
+  }
+  assert.equal(app.includes("勾配スポット"), true);
+});
+
+test("slope quest arrival message and log entry use the candidate label", () => {
+  const { hooks } = loadProductionAdventure();
+  assert.equal(hooks.slopeQuestArrivalMessage, "勾配スポットに到達！");
+  assert.equal(hooks.slopeQuestLabel, "勾配スポット");
+});
+
+test("slope quest notification element exists with a non-intrusive live region", () => {
+  const html = readFileSync(join(__dirname, "..", "index.html"), "utf8");
+  assert.equal(html.includes('id="slope-quest-notification"'), true);
+  const tagMatch = html.match(/<div[^>]*id="slope-quest-notification"[^>]*>/);
+  assert.ok(tagMatch);
+  assert.equal(tagMatch[0].includes('role="status"'), true);
+  assert.equal(tagMatch[0].includes('aria-live="polite"'), true);
+
+  const css = readFileSync(join(__dirname, "..", "styles.css"), "utf8");
+  const block = css.match(/#slope-quest-notification \{([\s\S]*?)\n\}/);
+  assert.ok(block);
+  assert.equal(block[1].includes("pointer-events: none"), true);
+});
+
+test("completion sheet has exactly one slope-quest result badge, hidden by default, not inside the 3-item stat list", () => {
+  const html = readFileSync(join(__dirname, "..", "index.html"), "utf8");
+  assert.equal(html.includes('id="slope-quest-result-badge"'), true);
+  const badgeMatch = html.match(/<div[^>]*id="slope-quest-result-badge"[^>]*>/);
+  assert.ok(badgeMatch);
+  assert.equal(badgeMatch[0].includes("hidden"), true);
+  assert.equal(html.includes("勾配スポットに到達"), true);
+
+  // 主要3項目の<ul>の中には無い（数値表へは入れない）
+  const completionStats = html.match(/<ul class="completion-stats">([\s\S]*?)<\/ul>/);
+  assert.ok(completionStats);
+  assert.equal(completionStats[1].includes("slope-quest-result-badge"), false);
+
+  // 「未達成」「クエスト 0」「あと○m」のような文言は出さない
+  for (const forbidden of ["未達成", "到達できませんでした", "挑戦失敗"]) {
+    assert.equal(html.includes(forbidden), false, `must not contain "${forbidden}"`);
+  }
+});
+
+test("slope quest marker is enlarged (pin ~1.5x, ring ~2x the previous 24px icon) with a one-shot completion pop", () => {
+  const css = readFileSync(join(__dirname, "..", "styles.css"), "utf8");
+  const marker = css.match(/\.slope-quest-marker \{([\s\S]*?)\n\}/);
+  const ring = css.match(/\.slope-quest-marker__ring \{([\s\S]*?)\n\}/);
+  const pin = css.match(/\.slope-quest-marker__pin \{([\s\S]*?)\n\}/);
+  assert.ok(marker && ring && pin);
+  assert.equal(marker[1].includes("48px"), true); // タップ領域 >= 44x44px
+  assert.equal(pin[1].includes("36px"), true);
+  assert.equal(css.includes(".slope-quest-marker.is-completing"), true);
+  assert.equal(css.includes(".slope-quest-marker.is-completed"), true);
+  assert.equal(css.includes(".slope-quest-marker.is-removing"), true);
+  assert.equal(css.includes("slope-quest-complete-pop"), true);
+  assert.equal(css.includes("slope-quest-ring-pulse"), true);
+});
+
+test("reduced-motion stops the ring pulse/pop and shortens notification transitions without hiding information", () => {
+  const css = readFileSync(join(__dirname, "..", "styles.css"), "utf8");
+  const block = css.match(
+    /@media \(prefers-reduced-motion: reduce\) \{([\s\S]*?)\n\}\n\n/,
+  );
+  const reduced = block ? block[1] : css;
+  assert.equal(reduced.includes("slope-quest-notification"), true);
+  assert.equal(reduced.includes(".slope-quest-marker__ring"), true);
+  assert.equal(reduced.includes(".slope-quest-marker.is-completing"), true);
 });
 
 test("service worker cache version includes the updated app shell", () => {
   const sw = readFileSync(join(__dirname, "..", "sw.js"), "utf8");
-  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v22"'), true);
+  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v26"'), true);
   for (const asset of ["./index.html", "./styles.css", "./app.js"]) {
     assert.equal(sw.includes(`"${asset}"`), true, `missing ${asset}`);
   }

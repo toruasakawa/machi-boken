@@ -326,3 +326,42 @@ test("getRouteShapeRenderData: 2+ points -> visible with a non-empty path", () =
   assert.ok(data.pathData.length > 0);
   assert.ok(data.bounds !== null);
 });
+
+test("getRouteShapeRenderData: share-card orientation is applied without losing the route", () => {
+  route.beginActiveAdventure();
+  route.setOrigin(TOKYO);
+  route.recordRoutePoint(35.6812, 139.7671, 0, 10);
+  route.recordRoutePoint(35.6813, 139.7671, 3000, 10);
+  const data = route.getRouteShapeRenderData({ rotationSteps: 1, flipX: true });
+  assert.equal(data.visible, true);
+  assert.equal(data.rotationSteps, 1);
+  assert.equal(data.flipX, true);
+  assert.ok(data.pathData.startsWith("M"));
+  assert.equal(data.pathData.includes("L"), true);
+});
+
+test("achievement card uses a GPS route SVG and has no cell-shape fallback", () => {
+  const html = readFileSync(join(__dirname, "..", "index.html"), "utf8");
+  const app = readFileSync(join(__dirname, "..", "app.js"), "utf8");
+  const css = readFileSync(join(__dirname, "..", "styles.css"), "utf8");
+
+  for (const required of [
+    'id="achievement-route-summary"',
+    'id="achievement-route-shape"',
+    'id="achievement-route-path"',
+  ]) {
+    assert.equal(html.includes(required), true, `missing ${required}`);
+  }
+  for (const removed of ["achievement-shape-grid", "shape-cell"]) {
+    assert.equal(html.includes(removed), false, `obsolete HTML ${removed}`);
+    assert.equal(css.includes(removed), false, `obsolete CSS ${removed}`);
+  }
+  for (const removed of ["renderShapeGrid", "computeSessionShapeCells"]) {
+    assert.equal(app.includes(removed), false, `obsolete JavaScript ${removed}`);
+  }
+  assert.equal(
+    app.includes('sectionId: "achievement-route-summary"'),
+    true,
+  );
+  assert.equal(app.includes("animate: false"), true);
+});

@@ -15,6 +15,27 @@ const MAX_QUEST_CANDIDATES = 10; // 標高APIに投げる候補数の上限
 const ELEVATION_ENDPOINT = "https://api.open-elevation.com/api/v1/lookup";
 const ELEVATION_TIMEOUT_MS = 8000; // 標高APIが固まった場合に諦めるまでの時間
 
+// 勾配クエスト: 現在の標高データだけでは特定地点が周辺で最上位の急さだと断定できないため、
+// 候補地点として扱う表記・演出へ変更する（候補選定アルゴリズム自体は変更しない）。
+const SLOPE_QUEST_LABEL = "勾配スポット";
+const SLOPE_QUEST_ARRIVAL_MESSAGE = "勾配スポットに到達！";
+const SLOPE_QUEST_CONFETTI = { intensity: "small", durationMs: 1200 }; // 時間達成と同程度〜やや弱め、累計節目より弱い
+// 到達演出のタイミング目安（すべて概算。歩行中でも読める長さを優先する）
+const SLOPE_QUEST_TIMING = {
+  checkStateDelayMs: 1000, // ポップ演出が落ち着いてからチェック済み状態へ切り替えるまで
+  reducedCheckStateDelayMs: 60, // reduced-motionでは即時に近い切り替えにする
+  holdCompletedMs: 1500, // チェック済み状態のまま見せておく時間
+  removeFadeMs: 400, // フェードアウトして地図から取り除くまでの所要時間
+};
+const SLOPE_QUEST_NOTIFICATION_TIMING = {
+  fadeInMs: 150,
+  holdMs: 1800,
+  fadeOutMs: 200,
+  reducedFadeInMs: 80,
+  reducedFadeOutMs: 80,
+};
+const DEBUG_SLOPE_QUEST = false; // trueにすると到達判定・演出の計測値をコンソールへ出力する（本番はfalse）
+
 const ACCURACY_OPEN_M = 60; // これより誤差が大きい測位ではセル開放/クエスト達成の判定に使わない
 const ACCURACY_WARN_M = 100; // これより誤差が大きい場合はユーザーに知らせる
 const ACCURACY_WARN_INTERVAL_MS = 15000; // 精度低下トーストを連発させないための間隔
@@ -63,7 +84,6 @@ const ADVENTURE_PRESETS = {
 };
 const ADVENTURE_PRESET_ORDER = ["short", "normal", "long"];
 const ADVENTURE_TIMER_INTERVAL_MS = 1000;
-const ADVENTURE_EXTENSION_MS = 5 * 60 * 1000;
 const TIME_GOAL_PRESENTATION_DELAY_MS = 180;
 
 // 距離は終了画面用。小さなGPS揺れと明らかなジャンプを成果へ混ぜない。
@@ -85,7 +105,12 @@ const ROUTE_RECORDING_CONFIG = {
   maxSpeedMps: DISTANCE_MAX_SPEED_MPS,
   maxPoints: 1000, // 配列の上限。超えたら2点に1点へ間引く（先頭の開始点は残す）
 };
-const DEBUG_ROUTE_SHAPE = false; // trueにすると冒険終了時にルート形状の計測値をコンソールへ出力する（本番はfalse）
+// 実機レビュー時だけURLへ ?debugRouteShape=1 を付け、件数・描画先・フォールバック有無を確認する。
+const DEBUG_ROUTE_SHAPE = Boolean(
+  typeof window !== "undefined" &&
+    window.location &&
+    new URLSearchParams(window.location.search).get("debugRouteShape") === "1",
+);
 
 // ルート形状の描画設定。地図タイルは使わず、SVGの相対座標だけで「形」を残す。
 const ROUTE_SHAPE_VIEWBOX = { width: 320, height: 170, padding: 24 };
@@ -115,9 +140,14 @@ const MILESTONE_MESSAGE_TIMING = {
   holdMs: 2200,
   fadeOutMs: 180,
 };
+const TIME_GOAL_MESSAGE_TIMING = {
+  fadeInMs: 150,
+  holdMs: 2200,
+  fadeOutMs: 180,
+  reducedFadeInMs: 80,
+  reducedFadeOutMs: 80,
+};
 const ADVENTURE_GOAL_MESSAGE = "今日の冒険を達成しました！";
-const ADVENTURE_GOAL_SUB_MESSAGE = "このまま続けても大丈夫。";
-const ADVENTURE_EXTENSION_MESSAGE = "追加の5分も歩きました。";
 const DEBUG_TIME_GOAL = false;
 
 // 発見数の節目（累計開放セル数）と演出メッセージ
@@ -237,11 +267,6 @@ const STORAGE_KEYS = {
   milestones: "am_milestones",
   privacyAck: "am_share_privacy_ack",
 };
-
-// 共有カードのシルエット表示: グリッド1マスあたりの最大/最小ピクセル数
-const SHAPE_GRID_MAX_PX = 220;
-const SHAPE_GRID_MAX_CELL_PX = 34;
-const SHAPE_GRID_MIN_CELL_PX = 14;
 
 /* ---------- ローカルストレージ ヘルパー ---------- */
 const store = {
@@ -425,15 +450,64 @@ function drawVisitedCell(ix, iy, opts) {
   return rect;
 }
 
+// 勾配スポットの候補マーカー本体。地図上で見つけやすいよう、旧アイコン(24px)より
+// ピン本体は約1.5倍(36px)・周囲リングは約2倍(48px)相当のCSS製マーカーへ変更した。
+let questMarker = null; // 現在表示中の勾配スポットマーカー（Leafletインスタンス）
+let slopeQuestMarkerTimers = []; // 到達演出（チェック済み化・フェードアウト）用のタイマーID
+// 到達演出(チェック済み化→フェードアウト)が終わるまでtrueにする。単なる同一tick内の
+// 多重実行ガードだけでなく、演出中に新しい候補(ensureQuest→drawQuestMarker)が
+// 割り込んで完了直後のマーカーを早期に消してしまうのを防ぐためにも使う。
+let slopeQuestCompletionInProgress = false;
+let pendingQuestMarkerRedraw = null; // 演出中に描画要求が来た場合、その候補データを保留しておく
+
+function clearSlopeQuestCompletionTimers() {
+  slopeQuestMarkerTimers.forEach((id) => clearTimeout(id));
+  slopeQuestMarkerTimers = [];
+  // タイマーごと止める＝演出サイクルは完了しないため、ガードを持ち越さないようここでも解除する
+  slopeQuestCompletionInProgress = false;
+  pendingQuestMarkerRedraw = null;
+}
+
+// 到達演出サイクル全体（チェック済み化→保持→フェードアウト削除）が終わったときに呼ぶ。
+// 演出中に保留されていた新しい候補描画があれば、ここで初めて反映する。
+function finishSlopeQuestCompletionCycle() {
+  slopeQuestCompletionInProgress = false;
+  if (pendingQuestMarkerRedraw) {
+    const next = pendingQuestMarkerRedraw;
+    pendingQuestMarkerRedraw = null;
+    drawQuestMarker(next);
+  }
+}
+
+function buildSlopeQuestIconHtml(isCompleted) {
+  const pinContent = isCompleted ? "✓" : "▲";
+  return `<div class="slope-quest-marker__ring"></div><div class="slope-quest-marker__pin">${pinContent}</div>`;
+}
+
 function drawQuestMarker(q) {
+  if (slopeQuestCompletionInProgress) {
+    // 完了演出（チェック済み表示→フェードアウト）の途中で新しい候補に差し替えない。
+    // 演出が終わった時点(finishSlopeQuestCompletionCycle)で改めて描画する。
+    pendingQuestMarkerRedraw = q;
+    logSlopeQuestDebug("marker-redraw-deferred", {
+      questCellId: cellKey(q.ix, q.iy),
+    });
+    return;
+  }
   questLayer.clearLayers();
+  clearSlopeQuestCompletionTimers();
   const icon = L.divIcon({
-    className: "quest-flag-icon",
-    html: "🚩",
-    iconSize: [24, 24],
+    className: "slope-quest-marker",
+    html: buildSlopeQuestIconHtml(false),
+    iconSize: [48, 48],
+    iconAnchor: [24, 24], // タップ領域(48x48)は44x44px以上の目安を満たす
   });
-  const marker = L.marker([q.lat, q.lon], { icon }).addTo(questLayer);
-  marker.on("click", () => openQuestPanel());
+  questMarker = L.marker([q.lat, q.lon], { icon }).addTo(questLayer);
+  questMarker.on("click", () => openQuestPanel());
+  const element = questMarker.getElement();
+  if (element) {
+    element.setAttribute("aria-label", `${SLOPE_QUEST_LABEL}候補`);
+  }
 }
 
 /* ==========================================================
@@ -566,14 +640,14 @@ function prefersReducedMotion() {
 function openQuestPanel() {
   el("quest-panel").classList.remove("hidden");
   if (quest) {
-    el("quest-desc").textContent =
-      "近くの坂・段差候補。到達すると開放されます。";
+    el("quest-desc").textContent = "地図上の勾配スポットへ行ってみよう。";
     el("quest-gradient").textContent =
       quest.gradientPct != null
         ? `勾配目安 ${quest.gradientPct}%`
         : "勾配 不明";
   } else {
-    el("quest-desc").textContent = "周辺を探索するとクエストが見つかります。";
+    el("quest-desc").textContent =
+      "周辺を探索すると勾配スポット候補が見つかります。";
     el("quest-gradient").textContent = "";
   }
 }
@@ -869,23 +943,23 @@ const adventureState = {
   startedAt: null,
   endedAt: null,
   elapsedAdventureMs: 0,
-  targetDurationMs: 0,
+  initialTargetDurationMs: 0,
   startLatLon: null, // 冒険開始地点（帰り道用）
   startCellId: null,
   hasLeftStartCell: false,
   goalReached: false,
-  initialGoalReached: false,
-  initialGoalEffectShown: false,
-  timeGoalPresentationIsInitial: false,
-  extensionCount: 0,
+  timeGoalNotificationPending: false,
+  timeGoalConfettiSuppressed: false,
   sessionVisitedCellIds: new Set(),
-  sessionVisitedCells: [], // 後から匿名形状へ利用できるよう、相対化前のセル座標も一時保持する
+  sessionVisitedCells: [], // セッション内で歩いたセル座標（終了画面には表示しない）
   sessionDiscoveredCellIds: new Set(),
-  sessionDiscoveredCells: [], // 共有カードの既存シルエット表示用
+  sessionDiscoveredCells: [], // セッション内で発見したセル座標（発見数とは分離して保持する）
   distanceMeters: 0,
   lastDistancePoint: null,
   routePoints: [], // 冒険中に記録したGPS軌跡 [{lat,lon,timestamp,accuracy,cumulativeDistanceM}]（セッション限定）
   lastRoutePoint: null, // 直前に「保存」した有効なルート点（記録間隔の判定に使う。lastDistancePointとは別管理）
+  slopeQuestCompleted: false, // 勾配スポットへ到達済みか（セッション限定。終了画面のバッジ表示に使う）
+  slopeQuestNotificationPending: false, // 発見通知・節目の後に回すための表示待ちフラグ
   completionData: null,
   currentCellId: null,
   discoveryFeedbackUntil: 0,
@@ -952,10 +1026,9 @@ function logTimeGoalDebug(event, overrides) {
     selectedPresetMinutes: preset ? preset.minutes : null,
     startedAt: adventureState.startedAt,
     elapsedAdventureMs: adventureState.elapsedAdventureMs,
-    targetDurationMs: adventureState.targetDurationMs,
+    initialTargetDurationMs: adventureState.initialTargetDurationMs,
     goalReached: adventureState.goalReached,
-    initialGoalReached: adventureState.initialGoalReached,
-    extensionCount: adventureState.extensionCount,
+    timeGoalNotificationPending: adventureState.timeGoalNotificationPending,
     sessionVisitedCellCount: adventureState.sessionVisitedCellIds.size,
     sessionDiscoveredCellCount: adventureState.sessionDiscoveredCellIds.size,
     currentCellId: adventureState.currentCellId,
@@ -986,7 +1059,7 @@ function renderAdventureUI() {
     "hidden",
     !(s === "idle" || s === "completed"),
   );
-  if (s !== "active") hideTimeGoalPanel(false);
+  if (s !== "active") hideTimeGoalNotification();
 }
 
 function setAdventureStatus(status) {
@@ -1003,15 +1076,13 @@ function resetAdventureStateKeepHistory() {
   adventureState.startedAt = null;
   adventureState.endedAt = null;
   adventureState.elapsedAdventureMs = 0;
-  adventureState.targetDurationMs = 0;
+  adventureState.initialTargetDurationMs = 0;
   adventureState.startLatLon = null;
   adventureState.startCellId = null;
   adventureState.hasLeftStartCell = false;
   adventureState.goalReached = false;
-  adventureState.initialGoalReached = false;
-  adventureState.initialGoalEffectShown = false;
-  adventureState.timeGoalPresentationIsInitial = false;
-  adventureState.extensionCount = 0;
+  adventureState.timeGoalNotificationPending = false;
+  adventureState.timeGoalConfettiSuppressed = false;
   adventureState.sessionVisitedCellIds = new Set();
   adventureState.sessionVisitedCells = [];
   adventureState.sessionDiscoveredCellIds = new Set();
@@ -1020,6 +1091,11 @@ function resetAdventureStateKeepHistory() {
   adventureState.lastDistancePoint = null;
   adventureState.routePoints = [];
   adventureState.lastRoutePoint = null;
+  adventureState.slopeQuestCompleted = false;
+  adventureState.slopeQuestNotificationPending = false;
+  // 候補地点(quest/questLayer)自体は冒険セッションと独立して維持する。ここでは前回セッションの
+  // 到達演出タイマー(チェック済み化・フェードアウト)だけを止め、次のセッションへ持ち越さない。
+  clearSlopeQuestCompletionTimers();
   adventureState.completionData = null;
   adventureState.discoveryFeedbackUntil = 0;
   adventureState.nightSafetyAcknowledged = false; // 新しい冒険開始時は夜間注意を再表示してよいためリセットする
@@ -1033,14 +1109,17 @@ function renderAdventureHud() {
     getAdventureProgressText({
       elapsedAdventureMs: adventureState.elapsedAdventureMs,
       sessionVisitedCellCount: adventureState.sessionVisitedCellIds.size,
+      goalReached: adventureState.goalReached,
     });
 }
 
 function getAdventureProgressText({
   elapsedAdventureMs,
   sessionVisitedCellCount,
+  goalReached,
 }) {
-  return `冒険中 ${formatAdventureMinutes(elapsedAdventureMs)} ・ 歩いた場所 ${sessionVisitedCellCount}`;
+  const statusLabel = goalReached ? "冒険達成" : "冒険中";
+  return `${statusLabel} ${formatAdventureMinutes(elapsedAdventureMs)} ・ 歩いた場所 ${sessionVisitedCellCount}`;
 }
 
 // アプリ起動後、初回の位置取得・地図準備が完了した直後に一度だけ呼ばれる（handlePosition内）。
@@ -1129,14 +1208,12 @@ function selectAdventurePreset(presetKey) {
   adventureState.startedAt = null;
   adventureState.endedAt = null;
   adventureState.elapsedAdventureMs = 0;
-  adventureState.targetDurationMs = preset.targetDurationMs;
+  adventureState.initialTargetDurationMs = preset.targetDurationMs;
   adventureState.startCellId = null;
   adventureState.hasLeftStartCell = false;
   adventureState.goalReached = false;
-  adventureState.initialGoalReached = false;
-  adventureState.initialGoalEffectShown = false;
-  adventureState.timeGoalPresentationIsInitial = false;
-  adventureState.extensionCount = 0;
+  adventureState.timeGoalNotificationPending = false;
+  adventureState.timeGoalConfettiSuppressed = false;
   adventureState.sessionVisitedCellIds = new Set();
   adventureState.sessionVisitedCells = [];
   adventureState.sessionDiscoveredCellIds = new Set();
@@ -1145,6 +1222,9 @@ function selectAdventurePreset(presetKey) {
   adventureState.lastDistancePoint = null;
   adventureState.routePoints = [];
   adventureState.lastRoutePoint = null;
+  adventureState.slopeQuestCompleted = false;
+  adventureState.slopeQuestNotificationPending = false;
+  clearSlopeQuestCompletionTimers();
   adventureState.completionData = null;
   adventureState.discoveryFeedbackUntil = 0;
   showDirectionPanel();
@@ -2039,18 +2119,30 @@ function confirmDirection() {
 
 /* ---------- セル発見リアクション ----------
    将来SEを追加しやすいよう、視覚・文言・振動のリアクションを一箇所にまとめる。 */
-function shouldTriggerAdventureGoal({
+function shouldTriggerInitialAdventureGoal({
   elapsedAdventureMs,
-  targetDurationMs,
+  initialTargetDurationMs,
   goalReached,
 }) {
   return (
     !goalReached &&
     Number.isFinite(elapsedAdventureMs) &&
-    Number.isFinite(targetDurationMs) &&
-    targetDurationMs > 0 &&
-    elapsedAdventureMs >= targetDurationMs
+    Number.isFinite(initialTargetDurationMs) &&
+    initialTargetDurationMs > 0 &&
+    elapsedAdventureMs >= initialTargetDurationMs
   );
+}
+
+function getTimeGoalMessageTiming(reducedMotion) {
+  return {
+    fadeInMs: reducedMotion
+      ? TIME_GOAL_MESSAGE_TIMING.reducedFadeInMs
+      : TIME_GOAL_MESSAGE_TIMING.fadeInMs,
+    holdMs: TIME_GOAL_MESSAGE_TIMING.holdMs,
+    fadeOutMs: reducedMotion
+      ? TIME_GOAL_MESSAGE_TIMING.reducedFadeOutMs
+      : TIME_GOAL_MESSAGE_TIMING.fadeOutMs,
+  };
 }
 
 function getTimeGoalPresentationDelay(now) {
@@ -2061,60 +2153,85 @@ function getTimeGoalPresentationDelay(now) {
   );
 }
 
-let timeGoalReturnFocusEl = null;
-
-function hideTimeGoalPanel(restoreFocus) {
-  const panel = el("time-goal-panel");
-  if (!panel) return;
-  panel.classList.add("hidden");
-  if (
-    restoreFocus !== false &&
-    timeGoalReturnFocusEl &&
-    typeof timeGoalReturnFocusEl.focus === "function"
-  ) {
-    try {
-      timeGoalReturnFocusEl.focus();
-    } catch (e) {
-      // 元の要素が既に無い場合は、冒険継続を優先する。
-    }
-  }
-  timeGoalReturnFocusEl = null;
+function hideTimeGoalNotification() {
+  const notification = el("time-goal-notification");
+  if (!notification) return;
+  notification.classList.remove("is-visible");
+  notification.classList.add("hidden");
 }
 
-function showTimeGoalPanel(isInitialGoal) {
-  if (adventureState.status !== "active" || !adventureState.goalReached) return;
-  const panel = el("time-goal-panel");
-  if (!timeGoalReturnFocusEl) timeGoalReturnFocusEl = document.activeElement;
-  adventureState.timeGoalPresentationIsInitial = isInitialGoal;
-  el("time-goal-title").textContent = isInitialGoal
-    ? ADVENTURE_GOAL_MESSAGE
-    : ADVENTURE_EXTENSION_MESSAGE;
-  el("time-goal-sub").textContent = ADVENTURE_GOAL_SUB_MESSAGE;
-  panel.classList.remove("hidden");
+function shouldSuppressTimeGoalConfettiForDiscovery() {
+  return (
+    discoveryNotificationState.phase === "milestone" ||
+    discoveryNotificationState.milestoneThreshold != null
+  );
+}
 
-  if (isInitialGoal && !adventureState.initialGoalEffectShown) {
-    adventureState.initialGoalEffectShown = true;
+function showTimeGoalNotification() {
+  if (
+    adventureState.status !== "active" ||
+    !adventureState.goalReached ||
+    !adventureState.timeGoalNotificationPending
+  ) {
+    return false;
+  }
+
+  const notification = el("time-goal-notification");
+  if (!notification) return false;
+  const timing = getTimeGoalMessageTiming(prefersReducedMotion());
+  const sessionId = adventureState.sessionId;
+  adventureState.timeGoalNotificationPending = false;
+  notification.textContent = ADVENTURE_GOAL_MESSAGE;
+  notification.classList.remove("hidden", "is-visible");
+  notification.style.setProperty("--time-goal-transition-ms", `${timing.fadeInMs}ms`);
+  void notification.offsetWidth;
+  notification.classList.add("is-visible");
+
+  if (!adventureState.timeGoalConfettiSuppressed) {
     spawnConfetti(TIME_GOAL_COMPLETION_EFFECT);
   }
 
-  const firstButton = panel.querySelector("button");
-  if (firstButton) firstButton.focus();
+  scheduleAdventureFeedbackAction(sessionId, timing.fadeInMs + timing.holdMs, () => {
+    notification.style.setProperty(
+      "--time-goal-transition-ms",
+      `${timing.fadeOutMs}ms`,
+    );
+    notification.classList.remove("is-visible");
+    scheduleAdventureFeedbackAction(sessionId, timing.fadeOutMs, () => {
+      notification.classList.add("hidden");
+    });
+  });
   logTimeGoalDebug("time-goal-presented", { timeGoalTriggered: true });
+  return true;
 }
 
-function scheduleTimeGoalPresentation(isInitialGoal) {
+function scheduleTimeGoalPresentation() {
+  if (!adventureState.timeGoalNotificationPending) return false;
   const sessionId = adventureState.sessionId;
+  clearAdventureFeedbackTimers();
   const attemptPresentation = () => {
     if (
       adventureState.status !== "active" ||
       !adventureState.goalReached ||
+      !adventureState.timeGoalNotificationPending ||
       adventureState.sessionId !== sessionId
     ) {
       return;
     }
 
+    if (
+      typeof document.visibilityState === "string" &&
+      document.visibilityState !== "visible"
+    ) {
+      // バックグラウンド中は表示時間を消費せず、復帰時のvisibilitychangeで再予約する。
+      return;
+    }
+
     const delayMs = getTimeGoalPresentationDelay();
-    if (delayMs > TIME_GOAL_PRESENTATION_DELAY_MS) {
+    if (
+      isDiscoveryNotificationActive() ||
+      delayMs > TIME_GOAL_PRESENTATION_DELAY_MS
+    ) {
       scheduleAdventureFeedbackAction(
         sessionId,
         delayMs + TIME_GOAL_PRESENTATION_DELAY_MS,
@@ -2123,7 +2240,7 @@ function scheduleTimeGoalPresentation(isInitialGoal) {
       return;
     }
 
-    showTimeGoalPanel(isInitialGoal);
+    showTimeGoalNotification();
   };
 
   scheduleAdventureFeedbackAction(
@@ -2131,13 +2248,14 @@ function scheduleTimeGoalPresentation(isInitialGoal) {
     getTimeGoalPresentationDelay(),
     attemptPresentation,
   );
+  return true;
 }
 
 function triggerAdventureTimeGoal() {
   if (
-    !shouldTriggerAdventureGoal({
+    !shouldTriggerInitialAdventureGoal({
       elapsedAdventureMs: adventureState.elapsedAdventureMs,
-      targetDurationMs: adventureState.targetDurationMs,
+      initialTargetDurationMs: adventureState.initialTargetDurationMs,
       goalReached: adventureState.goalReached,
     })
   ) {
@@ -2146,31 +2264,43 @@ function triggerAdventureTimeGoal() {
 
   // 表示より先に立て、インターバル復帰やGPS更新による二重実行を防ぐ。
   adventureState.goalReached = true;
-  const isInitialGoal = !adventureState.initialGoalReached;
-  if (isInitialGoal) adventureState.initialGoalReached = true;
-  adventureState.timeGoalPresentationIsInitial = isInitialGoal;
-  scheduleTimeGoalPresentation(isInitialGoal);
+  adventureState.timeGoalNotificationPending = true;
+  adventureState.timeGoalConfettiSuppressed =
+    shouldSuppressTimeGoalConfettiForDiscovery();
+  renderAdventureHud();
+  scheduleTimeGoalPresentation();
   logTimeGoalDebug("time-goal-triggered", { timeGoalTriggered: true });
   return true;
 }
 
-function extendAdventureFiveMinutes() {
-  if (adventureState.status !== "active" || !adventureState.goalReached) return;
-  adventureState.targetDurationMs += ADVENTURE_EXTENSION_MS;
-  adventureState.extensionCount += 1;
-  adventureState.goalReached = false;
-  hideTimeGoalPanel(true);
-  renderAdventureHud();
-  logTimeGoalDebug("adventure-extended");
+function handleAdventureVisibilityChange() {
+  if (document.visibilityState !== "visible") return;
+  const notificationWasPending = adventureState.timeGoalNotificationPending;
+  updateAdventureTime();
+  if (notificationWasPending && adventureState.timeGoalNotificationPending) {
+    scheduleTimeGoalPresentation();
+  }
 }
 
-function deferVisibleTimeGoalForDiscovery() {
-  const panel = el("time-goal-panel");
-  if (!panel || panel.classList.contains("hidden")) return false;
-  panel.classList.add("hidden");
-  const hudEndButton = el("btn-end-adventure");
-  if (hudEndButton) hudEndButton.focus();
-  scheduleTimeGoalPresentation(adventureState.timeGoalPresentationIsInitial);
+function deferTimeGoalNotificationForDiscovery(milestoneThreshold) {
+  if (adventureState.status !== "active" || !adventureState.goalReached) {
+    return false;
+  }
+
+  const notification = el("time-goal-notification");
+  const isVisible =
+    notification && notification.classList.contains("is-visible");
+  if (!isVisible && !adventureState.timeGoalNotificationPending) return false;
+
+  if (milestoneThreshold != null || isVisible) {
+    // 節目の紙吹雪を優先する。表示済み通知を発見が中断した場合も再紙吹雪は出さない。
+    adventureState.timeGoalConfettiSuppressed = true;
+  }
+  if (isVisible) {
+    adventureState.timeGoalNotificationPending = true;
+    hideTimeGoalNotification();
+  }
+  scheduleTimeGoalPresentation();
   return true;
 }
 
@@ -2529,6 +2659,13 @@ function runDiscoveryMessagePhase({
 
 function finishDiscoveryNotification() {
   clearDiscoveryNotification({ flushPendingToast: true });
+  // 優先順位: 発見通知＞累計節目＞勾配スポット到達＞時間達成。
+  if (adventureState.slopeQuestNotificationPending) {
+    showSlopeQuestNotification();
+  }
+  if (adventureState.timeGoalNotificationPending) {
+    scheduleTimeGoalPresentation();
+  }
 }
 
 function startSecondDiscoveryMessage() {
@@ -2678,7 +2815,7 @@ function handleCellDiscoveryFeedback(ix, iy, milestoneThreshold) {
     milestoneThreshold,
   });
   if (adventureSessionId != null) {
-    deferVisibleTimeGoalForDiscovery();
+    deferTimeGoalNotificationForDiscovery(milestoneThreshold);
   }
 
   logTimeGoalDebug("cell-discovered", { discoveryTriggered: true });
@@ -2708,6 +2845,13 @@ function showMilestoneCelebration(threshold, options) {
   const msg = MILESTONE_MESSAGES[threshold] || "新しい節目に到達しました。";
   if (!options || options.showToast !== false) showToast(msg, "milestone");
   pushLog("milestone", msg);
+  if (
+    adventureState.status === "active" &&
+    adventureState.goalReached &&
+    adventureState.timeGoalNotificationPending
+  ) {
+    adventureState.timeGoalConfettiSuppressed = true;
+  }
   try {
     spawnConfetti();
   } catch (e) {
@@ -2742,6 +2886,202 @@ function spawnConfetti(options) {
     layer.appendChild(piece);
     setTimeout(() => piece.remove(), durationMs + 300);
   }
+}
+
+/* ---------- 勾配スポット到達 ----------
+   到達しても即座にマーカーを消さず、短い反応(拡大・発光)→通知→チェック済み状態→
+   数秒後のフェードアウトという流れで達成感を返す。候補選定・標高取得は変更しない。
+   （slopeQuestCompletionInProgress / pendingQuestMarkerRedraw はdrawQuestMarker付近で宣言）
+   ========================================================== */
+
+function logSlopeQuestDebug(event, extra) {
+  if (!DEBUG_SLOPE_QUEST) return;
+  console.log("[slope-quest]", event, {
+    questExists: !!quest,
+    questLat: quest ? quest.lat : null,
+    questLng: quest ? quest.lon : null,
+    ...extra,
+  });
+}
+
+// 累計節目の紙吹雪が同時に出た場合は、勾配用の紙吹雪を重ねない（既存のtime-goal側と同じ判定）。
+function shouldSuppressSlopeQuestConfettiForDiscovery() {
+  return (
+    discoveryNotificationState.phase === "milestone" ||
+    discoveryNotificationState.milestoneThreshold != null
+  );
+}
+
+function showSlopeQuestNotification() {
+  adventureState.slopeQuestNotificationPending = false;
+  const notification = el("slope-quest-notification");
+  if (!notification) return false;
+  const reducedMotion = prefersReducedMotion();
+  const timing = {
+    fadeInMs: reducedMotion
+      ? SLOPE_QUEST_NOTIFICATION_TIMING.reducedFadeInMs
+      : SLOPE_QUEST_NOTIFICATION_TIMING.fadeInMs,
+    holdMs: SLOPE_QUEST_NOTIFICATION_TIMING.holdMs,
+    fadeOutMs: reducedMotion
+      ? SLOPE_QUEST_NOTIFICATION_TIMING.reducedFadeOutMs
+      : SLOPE_QUEST_NOTIFICATION_TIMING.fadeOutMs,
+  };
+  const sessionId = adventureState.sessionId;
+
+  notification.textContent = SLOPE_QUEST_ARRIVAL_MESSAGE;
+  notification.classList.remove("hidden", "is-visible");
+  notification.style.setProperty("--slope-quest-transition-ms", `${timing.fadeInMs}ms`);
+  void notification.offsetWidth;
+  notification.classList.add("is-visible");
+
+  // 時間達成通知が横取りしないよう、発見系と同じ「表示中は待たせる」締め切りを延長する。
+  adventureState.discoveryFeedbackUntil = Math.max(
+    adventureState.discoveryFeedbackUntil,
+    Date.now() +
+      timing.fadeInMs +
+      timing.holdMs +
+      timing.fadeOutMs +
+      TIME_GOAL_PRESENTATION_DELAY_MS,
+  );
+
+  scheduleAdventureFeedbackAction(sessionId, timing.fadeInMs + timing.holdMs, () => {
+    notification.style.setProperty(
+      "--slope-quest-transition-ms",
+      `${timing.fadeOutMs}ms`,
+    );
+    notification.classList.remove("is-visible");
+    scheduleAdventureFeedbackAction(sessionId, timing.fadeOutMs, () => {
+      notification.classList.add("hidden");
+    });
+  });
+
+  logSlopeQuestDebug("notification-shown", { notificationQueued: true });
+  return true;
+}
+
+function applySlopeQuestCompletedState() {
+  if (!questMarker) return;
+  const element = questMarker.getElement();
+  if (!element) return;
+  element.classList.remove("is-completing");
+  element.classList.add("is-completed");
+  element.innerHTML = buildSlopeQuestIconHtml(true);
+  element.setAttribute("aria-label", `${SLOPE_QUEST_LABEL}到達済み`);
+  logSlopeQuestDebug("marker-completed", { markerCompletedStateApplied: true });
+}
+
+// 到達演出サイクルの最終ステップ。マーカーを取り除いたら、演出中に保留していた
+// 新しい候補描画があればここで反映する（finishSlopeQuestCompletionCycle経由）。
+function removeSlopeQuestMarker() {
+  const marker = questMarker;
+  if (!marker) {
+    finishSlopeQuestCompletionCycle();
+    return;
+  }
+  const element = marker.getElement();
+  const finish = () => {
+    if (questLayer) questLayer.removeLayer(marker);
+    if (questMarker === marker) questMarker = null;
+    finishSlopeQuestCompletionCycle();
+  };
+  if (element && !prefersReducedMotion()) {
+    element.classList.add("is-removing");
+    setTimeout(finish, SLOPE_QUEST_TIMING.removeFadeMs + 60);
+  } else {
+    finish();
+  }
+}
+
+// 到達判定そのもの(同一セル一致)は既存仕様のまま。ログ用に、その判定根拠を明示的な形で残す。
+function buildSlopeQuestArrivalDebugContext(q, curLat, curLon) {
+  const { ix: curIx, iy: curIy } = cellIndex(curLat, curLon);
+  const currentCellId = cellKey(curIx, curIy);
+  const questCellId = cellKey(q.ix, q.iy);
+  return {
+    arrivalRule: "same-cell",
+    currentCellId,
+    questCellId,
+    isSameCell: currentCellId === questCellId,
+    approximateCellSizeM: CELL_SIZE_M,
+    distanceToQuestM: haversineMeters(curLat, curLon, q.lat, q.lon),
+  };
+}
+
+// 勾配スポットへの到達を検出した際の入口。handlePosition()から、既存の到達判定
+// (quest.ix===ix && quest.iy===iy、変更しない)がtrueの時だけ呼ばれる。
+function triggerSlopeQuestCompletion(q, curLat, curLon) {
+  const completionBefore = adventureState.slopeQuestCompleted;
+  if (completionBefore || slopeQuestCompletionInProgress) {
+    logSlopeQuestDebug("arrival-ignored", {
+      ...buildSlopeQuestArrivalDebugContext(q, curLat, curLon),
+      completionBefore,
+      completionAfter: adventureState.slopeQuestCompleted,
+      completionEffectTriggered: false,
+    });
+    return;
+  }
+  slopeQuestCompletionInProgress = true;
+  adventureState.slopeQuestCompleted = true;
+
+  const gradientLabel = q.gradientPct != null ? `勾配目安${q.gradientPct}%` : "";
+  pushLog("quest", `${SLOPE_QUEST_LABEL}に到達 ${gradientLabel}`.trim());
+
+  try {
+    if ("vibrate" in navigator) navigator.vibrate(35);
+  } catch (e) {
+    // 振動非対応・失敗（iPhone Safari等）でも到達自体は伝わるようにする
+  }
+
+  const reducedMotion = prefersReducedMotion();
+  const element = questMarker ? questMarker.getElement() : null;
+  if (element && !reducedMotion) {
+    element.classList.add("is-completing"); // 一度だけの拡大・リング発光（CSS側、約450ms）
+  }
+
+  const confettiSuppressed = shouldSuppressSlopeQuestConfettiForDiscovery();
+  let confettiTriggered = false;
+  if (!confettiSuppressed) {
+    try {
+      spawnConfetti(SLOPE_QUEST_CONFETTI);
+      confettiTriggered = true;
+    } catch (e) {
+      // 紙吹雪の失敗は無視して継続する
+    }
+  }
+
+  // 優先順位: 霧晴れ＞発見通知＞累計節目＞勾配スポット到達＞時間達成。
+  // 発見通知が進行中なら、その終了時(finishDiscoveryNotification)に回す。
+  const notificationQueued = true;
+  if (isDiscoveryNotificationActive()) {
+    adventureState.slopeQuestNotificationPending = true;
+  } else {
+    showSlopeQuestNotification();
+  }
+
+  const checkStateDelay = reducedMotion
+    ? SLOPE_QUEST_TIMING.reducedCheckStateDelayMs
+    : SLOPE_QUEST_TIMING.checkStateDelayMs;
+  const checkTimer = setTimeout(() => {
+    applySlopeQuestCompletedState();
+    const removeTimer = setTimeout(() => {
+      removeSlopeQuestMarker();
+    }, SLOPE_QUEST_TIMING.holdCompletedMs);
+    slopeQuestMarkerTimers.push(removeTimer);
+  }, checkStateDelay);
+  slopeQuestMarkerTimers.push(checkTimer);
+
+  logSlopeQuestDebug("completed", {
+    ...buildSlopeQuestArrivalDebugContext(q, curLat, curLon),
+    completionBefore,
+    completionAfter: adventureState.slopeQuestCompleted,
+    completionEffectTriggered: true,
+    confettiTriggered,
+    notificationQueued,
+  });
+
+  // slopeQuestCompletionInProgressはここではfalseに戻さない。到達演出サイクル全体
+  // (チェック済み化→保持→フェードアウト削除)が終わるまで維持し、
+  // finishSlopeQuestCompletionCycle()(removeSlopeQuestMarker経由)で解除する。
 }
 
 /* ---------- 今日歩いた形（ルート形状） ----------
@@ -2815,7 +3155,12 @@ function buildRoutePathData(points) {
 
 // 記録済みのルート点から、そのまま描画できる状態まで組み立てる。
 // 有効点が2未満の場合は、呼び出し側でルート枠自体を非表示にする。
-function getRouteShapeRenderData() {
+function getRouteShapeRenderData(options) {
+  const renderOptions = options || {};
+  const rotationSteps = Number.isFinite(renderOptions.rotationSteps)
+    ? Math.trunc(renderOptions.rotationSteps)
+    : 0;
+  const flipX = renderOptions.flipX === true;
   const rawCount = adventureState.routePoints.length;
   const validPoints = adventureState.routePoints.filter(
     (p) => Number.isFinite(p.lat) && Number.isFinite(p.lon),
@@ -2828,11 +3173,17 @@ function getRouteShapeRenderData() {
       validPointCount: validPoints.length,
       bounds: null,
       scale: null,
+      rotationSteps,
+      flipX,
     };
   }
 
   const relativePoints = projectRoutePoints(validPoints);
-  const orientedPoints = rotateRoutePoints(relativePoints, 0, false); // 通常表示は実際の向きのまま
+  const orientedPoints = rotateRoutePoints(
+    relativePoints,
+    rotationSteps,
+    flipX,
+  );
   const fitted = fitRoutePointsToViewBox(orientedPoints, ROUTE_SHAPE_VIEWBOX);
   return {
     visible: true,
@@ -2841,33 +3192,69 @@ function getRouteShapeRenderData() {
     validPointCount: validPoints.length,
     bounds: fitted.bounds,
     scale: fitted.scale,
+    rotationSteps,
+    flipX,
   };
 }
 
-function logRouteShapeDebug(renderData, renderedPathLength) {
+function logRouteShapeDebug(renderData, renderedPathLength, context) {
   if (!DEBUG_ROUTE_SHAPE) return;
+  const reviewContext = context || {};
   const lastPoint = adventureState.lastRoutePoint;
-  console.log("[route-shape]", {
+  console.log("[route-shape-review]", {
+    screenType: reviewContext.screenType || "completion-sheet",
+    selectedCardType: reviewContext.selectedCardType || null,
     rawRoutePointCount: renderData.rawPointCount,
     validRoutePointCount: renderData.validPointCount,
     simplifiedRoutePointCount: renderData.validPointCount, // 現状は記録間隔による間引きのみ
+    sessionVisitedCellCount: adventureState.sessionVisitedCellIds.size,
+    sessionDiscoveredCellCount: adventureState.sessionDiscoveredCellIds.size,
+    routePathD: renderData.pathData,
+    routeSvgExists: Boolean(
+      document.getElementById(reviewContext.svgId || "adventure-route-shape"),
+    ),
+    routePathExists: Boolean(
+      document.getElementById(reviewContext.pathId || "adventure-route-path"),
+    ),
+    oldCellShapeContainerExists: Boolean(
+      document.querySelector(
+        ".cell-shape, .share-cell-grid, .route-grid, .achievement-shape-grid",
+      ),
+    ),
+    routeRendererCalled: true,
+    cellShapeRendererCalled: false,
     routeDistanceM: lastPoint ? lastPoint.cumulativeDistanceM : 0,
     bounds: renderData.bounds,
     scale: renderData.scale,
+    rotationSteps: renderData.rotationSteps,
+    flipX: renderData.flipX,
     renderedPathLength,
-    routeShapeVisible: renderData.visible,
+    routeSvgVisible: renderData.visible,
   });
 }
 
-// 終了画面の「今日歩いた形」を描画する。歩いた順に線が描かれるアニメーション付き。
-// reduced-motionの場合は即時表示（フェードや拡大縮小は追加しない）。
-function renderRouteShape() {
-  const section = el("adventure-route-summary");
-  const svg = el("adventure-route-shape");
-  const path = el("adventure-route-path");
-  if (!section || !svg || !path) return;
+// 終了画面と成果カードで同じGPSルート描画を使う。成果カードでは向きを匿名化し、
+// 即時描画することで、カードを開いた直後のスクリーンショットでも線が欠けないようにする。
+function renderRouteShape(options) {
+  const renderOptions = options || {};
+  const sectionId = renderOptions.sectionId || "adventure-route-summary";
+  const svgId = renderOptions.svgId || "adventure-route-shape";
+  const pathId = renderOptions.pathId || "adventure-route-path";
+  const section = el(sectionId);
+  const svg = el(svgId);
+  const path = el(pathId);
+  if (!section || !svg || !path) return null;
 
-  const renderData = getRouteShapeRenderData();
+  const renderData = getRouteShapeRenderData({
+    rotationSteps: renderOptions.rotationSteps,
+    flipX: renderOptions.flipX,
+  });
+  const debugContext = {
+    screenType: renderOptions.screenType || "completion-sheet",
+    selectedCardType: renderOptions.selectedCardType || null,
+    svgId,
+    pathId,
+  };
   section.classList.toggle("hidden", !renderData.visible);
 
   if (!renderData.visible) {
@@ -2875,18 +3262,20 @@ function renderRouteShape() {
     path.style.transition = "none";
     path.style.strokeDasharray = "";
     path.style.strokeDashoffset = "";
-    logRouteShapeDebug(renderData, 0);
-    return;
+    logRouteShapeDebug(renderData, 0, debugContext);
+    return renderData;
   }
 
   // 多重アニメーション防止: 前回分のtransitionを一旦切ってから新しい形状・状態を設定する。
   path.style.transition = "none";
   path.setAttribute("d", renderData.pathData);
 
-  const length = typeof path.getTotalLength === "function" ? path.getTotalLength() : 0;
+  const length =
+    typeof path.getTotalLength === "function" ? path.getTotalLength() : 0;
   const reducedMotion = prefersReducedMotion();
+  const animate = renderOptions.animate !== false;
 
-  if (reducedMotion || !(length > 0)) {
+  if (!animate || reducedMotion || !(length > 0)) {
     path.style.strokeDasharray = "";
     path.style.strokeDashoffset = "0";
   } else {
@@ -2898,7 +3287,20 @@ function renderRouteShape() {
     });
   }
 
-  logRouteShapeDebug(renderData, length);
+  logRouteShapeDebug(renderData, length, debugContext);
+  return renderData;
+}
+
+// 共有カードでは北向きや左右関係を手掛かりにしにくくするため、セッションごとに
+// 90度単位の回転と左右反転を固定する。開き直してもカードの形は変わらない。
+function getAchievementRouteOrientation() {
+  const sessionSeed = Number.isFinite(adventureState.sessionId)
+    ? Math.abs(Math.trunc(adventureState.sessionId))
+    : 0;
+  return {
+    rotationSteps: sessionSeed % 2 === 0 ? 1 : 3,
+    flipX: Math.floor(sessionSeed / 2) % 2 === 1,
+  };
 }
 
 /* ---------- 冒険完了シート ---------- */
@@ -2916,8 +3318,8 @@ function getAdventureCompletionData() {
     startedAt: adventureState.startedAt,
     endedAt: adventureState.endedAt,
     selectedPresetMinutes: preset ? preset.minutes : null,
-    extensionCount: adventureState.extensionCount,
-    initialGoalReached: adventureState.initialGoalReached,
+    goalReached: adventureState.goalReached,
+    slopeQuestCompleted: adventureState.slopeQuestCompleted,
     direction: adventureState.direction ? { ...adventureState.direction } : null,
   };
 }
@@ -2944,6 +3346,11 @@ function showCompletionSheet(completionData) {
     data.distanceMeters,
   );
   el("completion-discovered-cells").textContent = `${data.discoveredCellCount}`;
+  const badge = el("slope-quest-result-badge");
+  if (badge) badge.hidden = !data.slopeQuestCompleted;
+  logSlopeQuestDebug("completion-sheet-rendered", {
+    resultBadgeShown: !!data.slopeQuestCompleted,
+  });
   lastCompletionMessage = getAdventureEndMessage(data.discoveredCellCount);
   el("completion-message").textContent = lastCompletionMessage;
   const firstBtn = el("completion-sheet").querySelector("button");
@@ -2994,7 +3401,6 @@ const FOCUS_TRAP_CONTAINER_IDS = [
   "night-warning-panel",
   "duration-panel",
   "direction-panel",
-  "time-goal-panel",
   "completion-sheet",
 ];
 let shareCardReturnFocusEl = null;
@@ -3084,57 +3490,6 @@ function showDirectionCard() {
   openShareCard("direction-card");
 }
 
-/* ---------- Priority 3: 今回歩いた形の匿名化 ----------
-   実際の緯度経度・セルの絶対座標は一切表示しない。
-   1) 最小X・最小Yを引いて原点へ移動
-   2) 0/90/180/270度のいずれかをランダムに適用
-   3) 再度、原点へ寄せて中央に収まる形だけを残す */
-function rotatePointCW90(p) {
-  return { x: -p.y, y: p.x };
-}
-
-function computeSessionShapeCells(cellIds) {
-  if (!cellIds || cellIds.length === 0) return [];
-  const minIx = Math.min(...cellIds.map((c) => c.ix));
-  const minIy = Math.min(...cellIds.map((c) => c.iy));
-  let points = cellIds.map((c) => ({ x: c.ix - minIx, y: c.iy - minIy }));
-
-  const rotations = Math.floor(Math.random() * 4); // 0,1,2,3 → 0/90/180/270度
-  for (let i = 0; i < rotations; i++) {
-    points = points.map(rotatePointCW90);
-  }
-
-  const minX = Math.min(...points.map((p) => p.x));
-  const minY = Math.min(...points.map((p) => p.y));
-  return points.map((p) => ({ x: p.x - minX, y: p.y - minY }));
-}
-
-function renderShapeGrid(container, cellIds) {
-  container.innerHTML = "";
-  const cells = computeSessionShapeCells(cellIds);
-  if (cells.length === 0) return;
-
-  const width = Math.max(...cells.map((c) => c.x)) + 1;
-  const height = Math.max(...cells.map((c) => c.y)) + 1;
-  const cellPx = Math.max(
-    SHAPE_GRID_MIN_CELL_PX,
-    Math.min(
-      SHAPE_GRID_MAX_CELL_PX,
-      Math.floor(SHAPE_GRID_MAX_PX / Math.max(width, height)),
-    ),
-  );
-  container.style.gridTemplateColumns = `repeat(${width}, ${cellPx}px)`;
-  container.style.gridTemplateRows = `repeat(${height}, ${cellPx}px)`;
-
-  cells.forEach((c) => {
-    const sq = document.createElement("div");
-    sq.className = "shape-cell";
-    sq.style.gridColumn = `${c.x + 1}`;
-    sq.style.gridRow = `${c.y + 1}`;
-    container.appendChild(sq);
-  });
-}
-
 /* ---------- Priority 2 + 4: 冒険成果カード ---------- */
 function showAchievementCard() {
   el("achievement-cell-count").textContent =
@@ -3162,12 +3517,22 @@ function showAchievementCard() {
   }
 
   try {
-    renderShapeGrid(
-      el("achievement-shape-grid"),
-      adventureState.sessionDiscoveredCells,
-    );
+    const orientation = getAchievementRouteOrientation();
+    renderRouteShape({
+      sectionId: "achievement-route-summary",
+      svgId: "achievement-route-shape",
+      pathId: "achievement-route-path",
+      screenType: "achievement-card",
+      selectedCardType: "achievement-card",
+      rotationSteps: orientation.rotationSteps,
+      flipX: orientation.flipX,
+      animate: false,
+    });
   } catch (e) {
-    // シルエット描画に失敗してもカード自体は表示する
+    // GPSルート描画に失敗してもカード本体は表示し、セル形状へは戻さない。
+    console.error("renderAchievementRouteShape failed", e);
+    const routeSummary = el("achievement-route-summary");
+    if (routeSummary) routeSummary.classList.add("hidden");
   }
 
   openShareCard("achievement-card");
@@ -3244,13 +3609,13 @@ function handlePosition(pos) {
     }
 
     if (quest && quest.ix === ix && quest.iy === iy) {
-      const g =
-        quest.gradientPct != null ? `勾配目安${quest.gradientPct}%` : "";
-      showToast(`クエスト達成！${g}`);
-      pushLog("quest", `勾配クエスト達成 ${g}`);
+      // 到達判定・候補データの扱いは変更しない。マーカーの見た目(チェック済み化→
+      // 数秒後のフェードアウト)はtriggerSlopeQuestCompletion側のタイマーに委ねるため、
+      // ここではquestLayerを即座にクリアしない。
+      const reachedQuest = quest;
       quest = null;
       store.set(STORAGE_KEYS.quest, null);
-      questLayer.clearLayers();
+      triggerSlopeQuestCompletion(reachedQuest, lat, lon);
     }
 
     updateFogCells(lat, lon); // 精度の粗い測位では霧の中心もずらさない（GPSノイズでの誤表示を避ける）
@@ -3400,14 +3765,7 @@ window.addEventListener("DOMContentLoaded", () => {
   // ---- 冒険開始・終了 ----
   el("btn-begin-adventure").addEventListener("click", beginAdventureFlow);
   el("btn-end-adventure").addEventListener("click", endAdventure);
-  el("btn-time-goal-end").addEventListener("click", endAdventure);
-  el("btn-time-goal-extend").addEventListener(
-    "click",
-    extendAdventureFiveMinutes,
-  );
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") updateAdventureTime();
-  });
+  document.addEventListener("visibilitychange", handleAdventureVisibilityChange);
 
   // ---- 冒険完了シート ----
   el("btn-open-way-home").addEventListener("click", openWayHome);

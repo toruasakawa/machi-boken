@@ -1121,51 +1121,67 @@ body {
   }
 }
 
-/* Leaflet marker tweak: 勾配スポット候補マーカー（旧24pxアイコンより見つけやすい大きさへ） */
+/* Leaflet marker tweak: 勾配スポット候補マーカー（フラッグ型。円形の現在地マーカーと混同しないよう
+   丸を使わず、旗竿(pole)+旗布(cloth)の形で構成する） */
 .slope-quest-marker {
   position: relative;
-  width: 48px; /* 周囲リング。旧アイコン(24px)の約2倍 */
+  width: 48px; /* タップ領域。44x44px以上 */
   height: 48px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
 }
+/* 旗竿の根元にある、地面へ落ちる薄い光の楕円。円形ピンではないため現在地マーカーとは混同しにくいが、
+   視認性のために弱いパルスだけ残す（「周囲リングは必要なら維持」に対応） */
 .slope-quest-marker__ring {
   position: absolute;
-  inset: 0;
+  left: 14px;
+  bottom: 1px;
+  width: 20px;
+  height: 7px;
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(245, 158, 11, 0.35), rgba(245, 158, 11, 0) 70%);
-  border: 1px solid rgba(245, 158, 11, 0.45);
+  background: radial-gradient(ellipse, rgba(245, 158, 11, 0.45), rgba(245, 158, 11, 0) 70%);
   animation: slope-quest-ring-pulse 2.4s ease-in-out infinite;
 }
-.slope-quest-marker__pin {
-  position: relative;
-  width: 36px; /* ピン本体。旧アイコン(24px)の約1.5倍 */
-  height: 36px;
-  border-radius: 50%;
+.slope-quest-marker__pole {
+  position: absolute;
+  left: 22px;
+  bottom: 3px;
+  width: 3px;
+  height: 32px;
+  background: #1f2937;
+  border-radius: 1px;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.5));
+}
+.slope-quest-marker__cloth {
+  position: absolute;
+  left: 25px;
+  top: 10px;
+  width: 23px;
+  height: 16px;
   background: var(--amber);
+  clip-path: polygon(0 0, 100% 32%, 0 68%);
   color: #111827;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 17px;
+  padding-left: 2px;
+  font-size: 11px;
   font-weight: 800;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
 }
 @keyframes slope-quest-ring-pulse {
   0%,
   100% {
     transform: scale(0.9);
-    opacity: 0.25;
+    opacity: 0.3;
   }
   50% {
-    transform: scale(1.08);
-    opacity: 0.55;
+    transform: scale(1.15);
+    opacity: 0.6;
   }
 }
 /* 到達時、一度だけ拡大して戻る（繰り返さない） */
 .slope-quest-marker.is-completing {
   animation: slope-quest-complete-pop 450ms ease-out;
+  transform-origin: 50% 96%; /* 旗竿の根元を軸に拡大し、地面から浮かないようにする */
 }
 @keyframes slope-quest-complete-pop {
   0% {
@@ -1185,22 +1201,22 @@ body {
 }
 @keyframes slope-quest-ring-flash {
   0% {
-    opacity: 0.25;
+    opacity: 0.3;
   }
   50% {
-    opacity: 0.9;
+    opacity: 0.95;
   }
   100% {
-    opacity: 0.25;
+    opacity: 0.3;
   }
 }
-/* チェック済み状態: リングの呼吸を止め、色を落ち着かせる */
+/* チェック済み状態: リングの呼吸を止め、旗布の色を落ち着かせる（形はフラッグのまま） */
 .slope-quest-marker.is-completed .slope-quest-marker__ring {
   animation: none;
-  opacity: 0.18;
+  opacity: 0.2;
 }
-.slope-quest-marker.is-completed .slope-quest-marker__pin {
-  background: rgba(148, 163, 184, 0.55);
+.slope-quest-marker.is-completed .slope-quest-marker__cloth {
+  background: rgba(148, 163, 184, 0.65);
   color: #f8fafc;
 }
 .slope-quest-marker.is-removing {

@@ -450,8 +450,8 @@ function drawVisitedCell(ix, iy, opts) {
   return rect;
 }
 
-// 勾配スポットの候補マーカー本体。地図上で見つけやすいよう、旧アイコン(24px)より
-// ピン本体は約1.5倍(36px)・周囲リングは約2倍(48px)相当のCSS製マーカーへ変更した。
+// 勾配スポットの候補マーカー本体。丸型ピンは現在地マーカー(円形・amber塗り)と
+// 見分けがつきにくかったため、旗竿+旗布のフラッグ型（丸を使わない形）へ変更した。
 let questMarker = null; // 現在表示中の勾配スポットマーカー（Leafletインスタンス）
 let slopeQuestMarkerTimers = []; // 到達演出（チェック済み化・フェードアウト）用のタイマーID
 // 到達演出(チェック済み化→フェードアウト)が終わるまでtrueにする。単なる同一tick内の
@@ -479,9 +479,11 @@ function finishSlopeQuestCompletionCycle() {
   }
 }
 
+// 旗竿(pole)+旗布(cloth)のフラッグ型マーカー。円は使わない。
+// clothの中身は未到達時は空、到達済みは"✓"のみ（絵文字の見た目に依存せずCSSで形自体を作る）。
 function buildSlopeQuestIconHtml(isCompleted) {
-  const pinContent = isCompleted ? "✓" : "▲";
-  return `<div class="slope-quest-marker__ring"></div><div class="slope-quest-marker__pin">${pinContent}</div>`;
+  const clothContent = isCompleted ? "✓" : "";
+  return `<span class="slope-quest-marker__ring"></span><span class="slope-quest-marker__pole"></span><span class="slope-quest-marker__cloth">${clothContent}</span>`;
 }
 
 function drawQuestMarker(q) {
@@ -499,8 +501,8 @@ function drawQuestMarker(q) {
   const icon = L.divIcon({
     className: "slope-quest-marker",
     html: buildSlopeQuestIconHtml(false),
-    iconSize: [48, 48],
-    iconAnchor: [24, 24], // タップ領域(48x48)は44x44px以上の目安を満たす
+    iconSize: [48, 48], // タップ領域(48x48)は44x44px以上の目安を満たす
+    iconAnchor: [24, 46], // 旗竿の根元（地面に立っている位置）を地図座標に合わせる
   });
   questMarker = L.marker([q.lat, q.lon], { icon }).addTo(questLayer);
   questMarker.on("click", () => openQuestPanel());
@@ -726,15 +728,54 @@ async function generateQuest(curLat, curLon) {
 
     shortlist.forEach((c, i) => {
       const elev = elevations[i + 1];
+      c.elevationM = elev; // デバッグログ用。選定式（gradientPct）自体はここでは変更しない
       const gradient = Math.abs(elev - curElev) / Math.max(c.dist, 1);
       c.gradientPct = Math.round(gradient * 100 * 10) / 10;
     });
 
     shortlist.sort((a, b) => b.gradientPct - a.gradientPct);
-    return shortlist[0];
+    const picked = shortlist[0];
+    // 一時デバッグ用: 平坦な地点が選ばれていないかを確認するための計測値。
+    // minimumRequiredGradePercentは現状常にnull＝最小勾配条件はまだ存在しない（未実装であることをそのまま示す）。
+    if (DEBUG_SLOPE_QUEST) {
+      console.log("[slope-quest-candidate]", {
+        candidateLat: picked.lat,
+        candidateLng: picked.lon,
+        startElevationM: curElev,
+        endElevationM: picked.elevationM,
+        elevationDifferenceM: Math.abs(picked.elevationM - curElev),
+        horizontalDistanceM: picked.dist,
+        estimatedGradePercent: picked.gradientPct,
+        candidateScore: picked.gradientPct,
+        minimumRequiredGradePercent: null,
+        selectionReason: "highest-estimated-grade-in-shortlist",
+        usedFallback: false,
+        renderedMarkerLat: picked.lat,
+        renderedMarkerLng: picked.lon,
+      });
+    }
+    return picked;
   } catch (e) {
     // 標高APIが失敗した場合は距離最短の候補をフォールバックにする
-    return { ...shortlist[0], gradientPct: null };
+    const fallback = { ...shortlist[0], gradientPct: null };
+    if (DEBUG_SLOPE_QUEST) {
+      console.log("[slope-quest-candidate]", {
+        candidateLat: fallback.lat,
+        candidateLng: fallback.lon,
+        startElevationM: null,
+        endElevationM: null,
+        elevationDifferenceM: null,
+        horizontalDistanceM: fallback.dist,
+        estimatedGradePercent: null,
+        candidateScore: null,
+        minimumRequiredGradePercent: null,
+        selectionReason: "elevation-api-failed-nearest-distance-fallback",
+        usedFallback: true,
+        renderedMarkerLat: fallback.lat,
+        renderedMarkerLng: fallback.lon,
+      });
+    }
+    return fallback;
   }
 }
 

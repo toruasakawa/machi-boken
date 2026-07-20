@@ -738,19 +738,37 @@ test("completion sheet has exactly one slope-quest result badge, hidden by defau
   }
 });
 
-test("slope quest marker is enlarged (pin ~1.5x, ring ~2x the previous 24px icon) with a one-shot completion pop", () => {
+test("slope quest marker is a flag (pole + cloth), not a circular pin, with a >=44x44 tap area and a one-shot completion pop", () => {
   const css = readFileSync(join(__dirname, "..", "styles.css"), "utf8");
   const marker = css.match(/\.slope-quest-marker \{([\s\S]*?)\n\}/);
   const ring = css.match(/\.slope-quest-marker__ring \{([\s\S]*?)\n\}/);
-  const pin = css.match(/\.slope-quest-marker__pin \{([\s\S]*?)\n\}/);
-  assert.ok(marker && ring && pin);
+  const pole = css.match(/\.slope-quest-marker__pole \{([\s\S]*?)\n\}/);
+  const cloth = css.match(/\.slope-quest-marker__cloth \{([\s\S]*?)\n\}/);
+  assert.ok(marker && ring && pole && cloth);
   assert.equal(marker[1].includes("48px"), true); // タップ領域 >= 44x44px
-  assert.equal(pin[1].includes("36px"), true);
+  // 旗竿・旗布のどちらにも border-radius: 50%（円形）を使わない＝現在地マーカーの丸型と混同しない
+  assert.equal(/border-radius:\s*50%/.test(pole[1]), false);
+  assert.equal(/border-radius:\s*50%/.test(cloth[1]), false);
+  assert.equal(cloth[1].includes("clip-path"), true);
   assert.equal(css.includes(".slope-quest-marker.is-completing"), true);
   assert.equal(css.includes(".slope-quest-marker.is-completed"), true);
   assert.equal(css.includes(".slope-quest-marker.is-removing"), true);
   assert.equal(css.includes("slope-quest-complete-pop"), true);
   assert.equal(css.includes("slope-quest-ring-pulse"), true);
+});
+
+test("slope quest flag markup avoids emoji-only rendering and differs from the current-location marker's circular fill color", () => {
+  const appJs = readFileSync(join(__dirname, "..", "app.js"), "utf8");
+  // 通常状態: pole/clothのみで構成し、絵文字だけに依存しない。到達済みのみ✓を使う（絵文字ではなく文字）。
+  const fnMatch = appJs.match(/function buildSlopeQuestIconHtml\([\s\S]*?\n\}/);
+  assert.ok(fnMatch);
+  assert.equal(fnMatch[0].includes("slope-quest-marker__pole"), true);
+  assert.equal(fnMatch[0].includes("slope-quest-marker__cloth"), true);
+
+  const css = readFileSync(join(__dirname, "..", "styles.css"), "utf8");
+  const pole = css.match(/\.slope-quest-marker__pole \{([\s\S]*?)\n\}/)[1];
+  const meMarkerColor = "#f59e0b"; // 現在地マーカー(meMarker)の塗り色
+  assert.equal(pole.includes(meMarkerColor), false); // 旗竿は現在地と同じ塗りを使わない
 });
 
 test("reduced-motion stops the ring pulse/pop and shortens notification transitions without hiding information", () => {
@@ -766,7 +784,7 @@ test("reduced-motion stops the ring pulse/pop and shortens notification transiti
 
 test("service worker cache version includes the updated app shell", () => {
   const sw = readFileSync(join(__dirname, "..", "sw.js"), "utf8");
-  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v26"'), true);
+  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v27"'), true);
   for (const asset of ["./index.html", "./styles.css", "./app.js"]) {
     assert.equal(sw.includes(`"${asset}"`), true, `missing ${asset}`);
   }

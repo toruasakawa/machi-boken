@@ -127,6 +127,7 @@
     </div>
     <p id="sign-sr-status" class="sr-only" aria-live="polite">まだ方角は決まっていません。</p>
     <button id="btn-spin-sign" class="sign-spin-btn" type="button">標識を回す</button>
+    <button id="btn-open-map-direction" class="map-direction-open-btn" type="button">地図を見て方向を決める</button>
     <div id="direction-result" class="direction-result hidden">
       <p id="direction-result-text" class="direction-result-text"></p>
       <p id="direction-result-sub" class="direction-result-sub"></p>
@@ -137,6 +138,26 @@
       <button id="btn-show-direction-card" class="share-trigger-btn" type="button">カード表示</button>
     </div>
   </div>
+</div>
+
+<!-- 地図を見て方向を選ぶ補助モード。標識フリックとは別の任意手段。経路案内・目的地設定ではない。
+     #mapはそのまま見せ、上下の帯だけが操作を受け付ける(styles.cssでpointer-events制御)。 -->
+<div id="map-direction-panel" class="hidden" role="dialog" aria-modal="true" aria-labelledby="map-direction-hint">
+  <p id="map-direction-hint" class="map-direction-hint">行きたい方向を地図で選んでください</p>
+  <button id="btn-map-direction-recenter" class="map-direction-recenter-btn" type="button" aria-label="現在地へ戻る">
+    <span class="map-direction-recenter-icon" aria-hidden="true"></span>
+  </button>
+  <div class="map-direction-bottom">
+    <p id="map-direction-selected" class="map-direction-selected hidden">
+      <span class="map-direction-selected-label">この方向へ</span>
+      <span id="map-direction-selected-text" class="map-direction-selected-text"></span>
+    </p>
+    <div class="map-direction-actions">
+      <button id="btn-map-direction-back" class="btn-secondary" type="button">標識に戻る</button>
+      <button id="btn-map-direction-confirm" class="btn-primary" type="button" disabled>この方向にする</button>
+    </div>
+  </div>
+  <p id="map-direction-sr-status" class="sr-only" aria-live="polite"></p>
 </div>
 
 <!-- 冒険完了シート -->

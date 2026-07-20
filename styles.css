@@ -50,6 +50,9 @@ body {
   border-radius: var(--radius);
   padding: 10px 14px;
 }
+#hud.hidden {
+  display: none;
+}
 .hud-stat {
   display: flex;
   flex-direction: column;
@@ -716,6 +719,10 @@ body {
   background: transparent;
   color: var(--text);
 }
+.btn-primary:disabled,
+.btn-secondary:disabled {
+  opacity: 0.4;
+}
 .share-trigger-btn {
   display: block;
   width: 100%;
@@ -727,6 +734,133 @@ body {
   color: var(--amber);
   font-size: 13px;
   font-weight: 700;
+}
+
+/* 標識画面の補助導線: 標識フリックより目立たせない、控えめなテキストリンク調 */
+.map-direction-open-btn {
+  display: block;
+  margin: 0 auto 18px;
+  padding: 6px 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-decoration: underline;
+}
+
+/* 地図を見て方向を選ぶ補助モード。#mapはそのまま表示し、この要素自体は
+   pointer-events:noneにして中央の地図操作(パン・ズーム・タップ)を妨げない。
+   実際に操作を受け付ける子要素(バナー・ボタン群)だけpointer-events:autoへ戻す。 */
+#map-direction-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 32;
+  pointer-events: none;
+}
+#map-direction-panel.hidden {
+  display: none;
+}
+.map-direction-hint {
+  pointer-events: auto;
+  position: absolute;
+  top: max(14px, env(safe-area-inset-top));
+  left: 16px;
+  right: 16px;
+  margin: 0;
+  padding: 10px 16px;
+  border-radius: 12px;
+  background: rgba(17, 24, 39, 0.85);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+}
+.map-direction-recenter-btn {
+  pointer-events: auto;
+  position: absolute;
+  right: 16px;
+  bottom: 168px;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 1px solid var(--panel-border);
+  background: rgba(17, 24, 39, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.map-direction-recenter-icon {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--amber);
+  position: relative;
+}
+.map-direction-recenter-icon::after {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  background: var(--amber);
+}
+.map-direction-bottom {
+  pointer-events: auto;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--panel);
+  border-top: 1px solid var(--panel-border);
+  border-radius: 18px 18px 0 0;
+  padding: 14px 20px max(16px, env(safe-area-inset-bottom));
+}
+.map-direction-selected {
+  margin: 0 0 12px;
+  text-align: center;
+}
+.map-direction-selected.hidden {
+  display: none;
+}
+.map-direction-selected-label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.map-direction-selected-text {
+  display: block;
+  font-size: 20px;
+  font-weight: 700;
+}
+.map-direction-actions {
+  display: flex;
+  gap: 10px;
+}
+
+/* 地図タップ地点: 目的地ピンではなく方角を示す仮の点。丸(glow)+矢印のみで、
+   経路や到着地点を連想させる大きなピン形状は使わない。 */
+.map-direction-point {
+  position: relative;
+  width: 26px;
+  height: 26px;
+}
+.map-direction-point__glow {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(251, 191, 36, 0.45), rgba(251, 191, 36, 0) 70%);
+}
+.map-direction-point__arrow {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 0;
+  height: 0;
+  margin-left: -6px;
+  margin-top: -9px;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-bottom: 12px solid var(--amber);
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
 }
 
 /* 冒険完了シート: 今日歩いた形（ルート形状。地図タイルは使わず線だけを見せる） */

@@ -9,6 +9,11 @@
 // 安全に包含できる値にしておく（実測: 375px/320px幅いずれもpadding:4で全セル正常描画）。
 const MAP_SVG_RENDER_PADDING = 4;
 
+// 地図を見て方向を選ぶ補助モード（標識フリックの代わりに、地図タップで方角を選ぶ）。
+// 経路案内・目的地保存機能ではなく、あくまで8方位を決めるための一時的な操作。
+const MAP_DIRECTION_INITIAL_ZOOM = 16; // 通常のズーム(17)よりわずかに広く表示する固定値
+const MAP_DIRECTION_SIGN_SPIN_MS = 600; // 確定後、標識が選択方向へ回る所要時間（0.4〜0.8秒の範囲）
+
 const CELL_SIZE_M = 200; // 1セルの一辺（メートル）
 const QUEST_RING_CELLS = 4; // 現在地から何セル分の範囲でクエスト候補を探すか（≒800m）
 const MAX_QUEST_CANDIDATES = 10; // 標高APIに投げる候補数の上限
@@ -354,6 +359,7 @@ let map, cellsLayer, questLayer, meMarker;
 let fogLayer = null; // 霧レイヤー（L.layerGroup）
 let fogRenderer = null; // 霧pane専用のSVGレンダラー（padding拡張のため個別に生成する。理由はinitMap参照）
 let currentLocationRenderer = null; // 現在地pane専用のSVGレンダラー（冒険で地図中心から離れても消えないように同様に拡張）
+let mapDirectionRenderer = null; // 地図で方向を選ぶ補助モード用のpane専用SVGレンダラー
 const fogLayersByCellId = new Map(); // セルID -> 霧のLeafletレイヤー（重複防止・差分更新用）
 let lastFogCenterCell = null; // 直近に霧を再計算した中心セル（無駄な再計算を防ぐ）
 
@@ -376,16 +382,26 @@ function initMap(lat, lon) {
   const currentLocationPane = map.createPane("currentLocationPane");
   currentLocationPane.style.zIndex = 450; // 訪問済み色より上、クエスト旗(markerPane=600)より下に現在地を保つ
   currentLocationPane.style.pointerEvents = "none";
+  // 地図で方向を選ぶ補助モード用の方向線・タップ地点。クエスト旗(markerPane=600)より上に置き、
+  // 重なっても見失わないようにする。pointer-events:noneで地図のパン・ズーム・タップは妨げない。
+  const mapDirectionPane = map.createPane("mapDirectionPane");
+  mapDirectionPane.style.zIndex = 620;
+  mapDirectionPane.style.pointerEvents = "none";
 
   // 独自paneはLeafletの既定レンダラー(map.options.renderer)を継承せず、パン名ごとに
   // 新しいSVGレンダラーをpadding:0.1(既定)で自動生成してしまう。霧は最大
   // CELL_SIZE_M*(ringCells + 1) メートル先まで生成するため、既定paddingの
   // 描画範囲を超えたセルは座標が空になり完全に不可視化する（色・z-indexとは無関係の不具合）。
   // 現在地マーカーも、冒険で歩いて地図中心から離れると同じ理由で消えうるため合わせて対象にする。
+  // 方向線も、選択後に地図をパンして離れると同じ理由で消えうるため合わせて対象にする。
   // pane専用のレンダラーを明示的に作り、各レイヤー生成時にrendererオプションで渡すことで防ぐ。
   fogRenderer = L.svg({ pane: "fogPane", padding: MAP_SVG_RENDER_PADDING }).addTo(map);
   currentLocationRenderer = L.svg({
     pane: "currentLocationPane",
+    padding: MAP_SVG_RENDER_PADDING,
+  }).addTo(map);
+  mapDirectionRenderer = L.svg({
+    pane: "mapDirectionPane",
     padding: MAP_SVG_RENDER_PADDING,
   }).addTo(map);
 
@@ -505,7 +521,15 @@ function drawQuestMarker(q) {
     iconAnchor: [24, 46], // 旗竿の根元（地面に立っている位置）を地図座標に合わせる
   });
   questMarker = L.marker([q.lat, q.lon], { icon }).addTo(questLayer);
-  questMarker.on("click", () => openQuestPanel());
+  questMarker.on("click", (e) => {
+    // 地図で方向を選ぶ補助モード中は、旗をタップしても目的地確定しない。
+    // 通常の地図タップと同じ扱いにし、その位置への方角だけを示す。
+    if (mapDirectionModeActive) {
+      handleMapDirectionTap(e);
+      return;
+    }
+    openQuestPanel();
+  });
   const element = questMarker.getElement();
   if (element) {
     element.setAttribute("aria-label", `${SLOPE_QUEST_LABEL}候補`);
@@ -981,6 +1005,7 @@ const adventureState = {
   status: "idle", // idle | choosingDuration | choosingDirection | active | completed
   preset: null,
   direction: null, // {sector, label, bearingDeg}
+  directionSelectionMode: null, // "flick" | "map"（デバッグ・将来の分析用。終了画面には表示しない。localStorageへも保存しない）
   startedAt: null,
   endedAt: null,
   elapsedAdventureMs: 0,
@@ -1114,6 +1139,7 @@ function resetAdventureStateKeepHistory() {
   clearDiscoveryNotification({ flushPendingToast: false });
   adventureState.preset = null;
   adventureState.direction = null;
+  adventureState.directionSelectionMode = null;
   adventureState.startedAt = null;
   adventureState.endedAt = null;
   adventureState.elapsedAdventureMs = 0;
@@ -1246,6 +1272,7 @@ function selectAdventurePreset(presetKey) {
   adventureState.sessionId++;
   adventureState.preset = presetKey;
   adventureState.direction = null;
+  adventureState.directionSelectionMode = null;
   adventureState.startedAt = null;
   adventureState.endedAt = null;
   adventureState.elapsedAdventureMs = 0;
@@ -2081,6 +2108,8 @@ function finishSpin(targetSector) {
 function onSignSettled(sector) {
   const label = COMPASS_LABELS[sector];
   adventureState.direction = { sector, label, bearingDeg: sector * 45 };
+  // 地図選択からの確定(spinSignToMapSector)は、この直後に同期的に"map"へ上書きする。
+  adventureState.directionSelectionMode = "flick";
   el("direction-result-text").textContent = `今日は${label}へ。`;
   // 夜間は「普段なら選ばない道」を推奨せず、安全な道を選ぶ補足へ差し替える（昼間の文言は変更しない）。
   el("direction-result-sub").textContent = isNightTime()
@@ -2111,6 +2140,7 @@ function showDirectionPanel() {
 function redoDirection() {
   el("direction-result").classList.add("hidden");
   adventureState.direction = null;
+  adventureState.directionSelectionMode = null;
   el("sign-sr-status").textContent =
     "方角をやり直します。もう一度、標識を回すボタンを押してください。";
   const spinBtn = el("btn-spin-sign");
@@ -2156,6 +2186,256 @@ function confirmDirection() {
   startAdventureTimer();
   showToast(`${adventureState.direction.label}へ冒険開始！`);
   logTimeGoalDebug("adventure-started");
+}
+
+/* ==========================================================
+   地図を見て方向を選ぶ補助モード
+   標識フリックが主役の体験であることは変えず、行き先のイメージはあるが
+   それがどの方角か分からないユーザーのための補助手段として追加する。
+   経路案内・目的地設定ではなく、あくまで8方位を1つ選ぶための一時的な操作。
+   タップ地点の緯度経度は方向確定後に保持しない（保存するのは8方位と選択方法のみ）。
+   ========================================================== */
+let mapDirectionModeActive = false;
+let mapDirectionSelectedLatLon = null; // {lat, lon} 一時的な選択点。確定・モード終了で必ずnullへ戻す
+let mapDirectionBearingDeg = null;
+let mapDirectionSector = null;
+let mapDirectionLineLayer = null;
+let mapDirectionPointMarker = null;
+let mapDirectionReturnFocusEl = null; // 「標識に戻る」時にフォーカスを戻す先
+
+function buildMapDirectionPointIconHtml() {
+  return `<span class="map-direction-point__glow"></span><span class="map-direction-point__arrow"></span>`;
+}
+
+// GPS現在地(reliableな最新値。無ければ直近の既知位置)を返す。地図の表示中心(パン後の地図中央)は使わない。
+function getCurrentPositionForMapDirection() {
+  if (lastReliablePosition) {
+    return { lat: lastReliablePosition.lat, lon: lastReliablePosition.lon };
+  }
+  if (lastKnownLatLon) return { ...lastKnownLatLon };
+  return null;
+}
+
+// computeFrontierDirection()と同じ「ローカル平面座標(toMeters)上のatan2」方式に合わせ、
+// 標識フリックで確定する方向(adventureState.direction)と同じsector/bearingDeg形式で返す。
+function computeMapDirectionBearing(curLat, curLon, targetLat, targetLon) {
+  const curXY = toMeters(curLat, curLon);
+  const targetXY = toMeters(targetLat, targetLon);
+  const bearingDeg =
+    ((Math.atan2(targetXY.x - curXY.x, targetXY.y - curXY.y) * 180) / Math.PI +
+      360) %
+    360;
+  const sector = Math.round(bearingDeg / 45) % 8;
+  return { bearingDeg, sector };
+}
+
+// 「地図を見て方向を決める」ボタンの入口。現在地が既にあれば即座にモードを開く。
+// 万一まだ無い場合だけ、押した後に一度取得を試みる（取得中/失敗の文言を表示）。
+function openMapDirectionMode() {
+  if (mapDirectionModeActive) return;
+  const currentPos = getCurrentPositionForMapDirection();
+  if (currentPos) {
+    enterMapDirectionMode(currentPos);
+    return;
+  }
+  if (!("geolocation" in navigator)) {
+    showToast("現在地を確認できませんでした。標識をはじいて方向を決めることもできます。");
+    return;
+  }
+  showToast("現在地を確認しています");
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      const p = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+      lastKnownLatLon = { ...p };
+      enterMapDirectionMode(p);
+    },
+    () => {
+      showToast("現在地を確認できませんでした。標識をはじいて方向を決めることもできます。");
+    },
+    { timeout: 8000, maximumAge: 10000 },
+  );
+}
+
+function enterMapDirectionMode(currentPos) {
+  mapDirectionModeActive = true;
+  mapDirectionSelectedLatLon = null;
+  mapDirectionBearingDeg = null;
+  mapDirectionSector = null;
+  mapDirectionReturnFocusEl = document.activeElement;
+
+  el("direction-panel").classList.add("hidden");
+  el("hud").classList.add("hidden"); // ログ等の操作と重ならないよう、選択中は上部HUDを隠す
+  el("map-direction-hint").textContent = "行きたい方向を地図で選んでください";
+  el("map-direction-selected").classList.add("hidden");
+  el("btn-map-direction-confirm").disabled = true;
+  el("map-direction-sr-status").textContent =
+    "行きたい方向を地図で選んでください。地図をタップすると方角が決まります。";
+  el("map-direction-panel").classList.remove("hidden");
+
+  if (map) {
+    map.setView([currentPos.lat, currentPos.lon], MAP_DIRECTION_INITIAL_ZOOM, {
+      animate: !prefersReducedMotion(),
+    });
+    map.on("click", handleMapDirectionTap);
+  }
+  const backBtn = el("btn-map-direction-back");
+  if (backBtn) backBtn.focus();
+}
+
+// 地図タップ・勾配スポット旗タップの両方から呼ばれる共通入口。
+// 旗をタップしても目的地確定はしない（openQuestPanelを呼ばず、通常のタップと同様に方角だけ示す）。
+function handleMapDirectionTap(e) {
+  if (!mapDirectionModeActive || !e || !e.latlng) return;
+  const currentPos = getCurrentPositionForMapDirection();
+  if (!currentPos) return; // 現在地が無い状態では選択を進めない安全装置
+  const lat = e.latlng.lat;
+  const lon = e.latlng.lng;
+  mapDirectionSelectedLatLon = { lat, lon };
+  const { bearingDeg, sector } = computeMapDirectionBearing(
+    currentPos.lat,
+    currentPos.lon,
+    lat,
+    lon,
+  );
+  mapDirectionBearingDeg = bearingDeg;
+  mapDirectionSector = sector;
+  renderMapDirectionSelection(currentPos, { lat, lon }, bearingDeg, sector);
+}
+
+// 現在地→タップ地点の方向線・矢印を描画/更新する。経路ではなくただの直線で、道には沿わせない。
+function renderMapDirectionSelection(currentPos, tapPos, bearingDeg, sector) {
+  const label = COMPASS_LABELS[sector];
+
+  const latlngs = [
+    [currentPos.lat, currentPos.lon],
+    [tapPos.lat, tapPos.lon],
+  ];
+  if (mapDirectionLineLayer) {
+    mapDirectionLineLayer.setLatLngs(latlngs);
+  } else {
+    mapDirectionLineLayer = L.polyline(latlngs, {
+      pane: "mapDirectionPane",
+      renderer: mapDirectionRenderer,
+      className: "map-direction-line",
+      color: "#fbbf24",
+      weight: 2,
+      opacity: 0.75,
+      interactive: false,
+    }).addTo(map);
+  }
+
+  if (mapDirectionPointMarker) {
+    mapDirectionPointMarker.setLatLng([tapPos.lat, tapPos.lon]);
+  } else {
+    const icon = L.divIcon({
+      className: "map-direction-point",
+      html: buildMapDirectionPointIconHtml(),
+      iconSize: [26, 26],
+      iconAnchor: [13, 13],
+    });
+    mapDirectionPointMarker = L.marker([tapPos.lat, tapPos.lon], {
+      pane: "mapDirectionPane",
+      icon,
+      interactive: false,
+    }).addTo(map);
+  }
+  // 矢印は8方位への丸め前、実際に線が向いている角度(bearingDeg)へ合わせる（線とのズレを防ぐ）
+  const pointEl = mapDirectionPointMarker.getElement();
+  const arrow = pointEl ? pointEl.querySelector(".map-direction-point__arrow") : null;
+  if (arrow) arrow.style.transform = `rotate(${bearingDeg}deg)`;
+
+  el("map-direction-hint").textContent =
+    "この方角を目安に、安全な道を選んでください";
+  el("map-direction-selected-text").textContent = label;
+  el("map-direction-selected").classList.remove("hidden");
+  el("btn-map-direction-confirm").disabled = false;
+  el("map-direction-sr-status").textContent = `この方向へ ${label}`;
+}
+
+// ズームは変えず、現在地を中央付近へ戻すだけ。選択中の方角・線・タップ地点は維持する。
+function recenterMapDirection() {
+  if (!map) return;
+  const currentPos = getCurrentPositionForMapDirection();
+  if (!currentPos) return;
+  map.setView([currentPos.lat, currentPos.lon], map.getZoom(), {
+    animate: !prefersReducedMotion(),
+  });
+}
+
+// モードを閉じる共通処理。確定・戻る操作どちらからも呼ばれ、選択点・方向線・一時状態を必ずクリアする
+// （前回の選択が次回のモード起動へ残らないようにするため）。
+function closeMapDirectionOverlay() {
+  mapDirectionModeActive = false;
+  mapDirectionSelectedLatLon = null;
+  mapDirectionBearingDeg = null;
+  mapDirectionSector = null;
+  if (map) {
+    map.off("click", handleMapDirectionTap);
+    if (mapDirectionLineLayer) {
+      map.removeLayer(mapDirectionLineLayer);
+      mapDirectionLineLayer = null;
+    }
+    if (mapDirectionPointMarker) {
+      map.removeLayer(mapDirectionPointMarker);
+      mapDirectionPointMarker = null;
+    }
+  }
+  el("map-direction-panel").classList.add("hidden");
+  el("hud").classList.remove("hidden");
+}
+
+// 「標識に戻る」。方向は確定せず、標識の状態(既存のadventureState.direction/回転)は一切変更しない。
+function cancelMapDirectionMode() {
+  if (!mapDirectionModeActive) return;
+  closeMapDirectionOverlay();
+  el("direction-panel").classList.remove("hidden");
+  const spinBtn = el("btn-spin-sign");
+  if (spinBtn) {
+    spinBtn.focus();
+  } else if (
+    mapDirectionReturnFocusEl &&
+    typeof mapDirectionReturnFocusEl.focus === "function"
+  ) {
+    mapDirectionReturnFocusEl.focus();
+  }
+}
+
+// 「この方向にする」。モードを閉じ、標識画面へ戻した上で、標識を選んだ方角へ短く回してから
+// 通常の方向確定(onSignSettled→#direction-result表示)と合流させる。冒険はまだ開始しない。
+function confirmMapDirection() {
+  if (!mapDirectionModeActive || mapDirectionSector == null) return;
+  const sector = mapDirectionSector;
+  closeMapDirectionOverlay();
+  el("direction-panel").classList.remove("hidden");
+  el("direction-result").classList.add("hidden");
+  spinSignToMapSector(sector);
+}
+
+// 標識フリックの物理演算は使わず、現在の角度から選択方角へ最短距離で短く回すだけの単純な遷移。
+// 完了後はfinishSpin()→onSignSettled()という既存の確定処理へそのまま合流させる。
+function spinSignToMapSector(sector) {
+  cancelSignAnimation();
+  signSpinning = true;
+  el("sign-board").classList.add("spinning");
+
+  const startRotation = currentSignRotation;
+  const targetBearingDeg = sector * 45;
+  const currentMod = ((startRotation % 360) + 360) % 360;
+  const shortestDelta = ((targetBearingDeg - currentMod + 540) % 360) - 180;
+  const finalRotation = startRotation + shortestDelta;
+
+  const settle = () => {
+    finishSpin(sector); // 内部でonSignSettled(sector)を呼び、directionSelectionModeを"flick"にする
+    adventureState.directionSelectionMode = "map"; // 地図選択由来のため直後に上書きする
+  };
+
+  if (prefersReducedMotion()) {
+    currentSignRotation = finalRotation;
+    applySignRotation(currentSignRotation);
+    settle();
+    return;
+  }
+  tweenRotation(startRotation, finalRotation, MAP_DIRECTION_SIGN_SPIN_MS, settle);
 }
 
 /* ---------- セル発見リアクション ----------
@@ -3442,6 +3722,7 @@ const FOCUS_TRAP_CONTAINER_IDS = [
   "night-warning-panel",
   "duration-panel",
   "direction-panel",
+  "map-direction-panel",
   "completion-sheet",
 ];
 let shareCardReturnFocusEl = null;
@@ -3791,6 +4072,12 @@ window.addEventListener("DOMContentLoaded", () => {
   el("btn-spin-sign").addEventListener("click", startButtonSpin);
   el("btn-redo-direction").addEventListener("click", redoDirection);
   el("btn-confirm-direction").addEventListener("click", confirmDirection);
+
+  // ---- 地図を見て方向を選ぶ補助モード ----
+  el("btn-open-map-direction").addEventListener("click", openMapDirectionMode);
+  el("btn-map-direction-back").addEventListener("click", cancelMapDirectionMode);
+  el("btn-map-direction-confirm").addEventListener("click", confirmMapDirection);
+  el("btn-map-direction-recenter").addEventListener("click", recenterMapDirection);
 
   // ---- 夜間セーフティ ----
   el("btn-night-cancel").addEventListener("click", () => {

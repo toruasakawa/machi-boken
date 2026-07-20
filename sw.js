@@ -1,4 +1,4 @@
-const CACHE_NAME = "machi-boken-v27";
+const CACHE_NAME = "machi-boken-v28";
 const SHELL_ASSETS = [
   "./",
   "./index.html",

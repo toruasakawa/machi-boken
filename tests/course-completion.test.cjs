@@ -59,7 +59,7 @@ function loadProductionAdventure() {
       queueDiscoveryNotification,
       resetAdventureStateKeepHistory,
       shouldSuppressSlopeQuestConfettiForDiscovery,
-      slopeQuestArrivalMessage: SLOPE_QUEST_ARRIVAL_MESSAGE,
+      slopeQuestCompletionMessage: SLOPE_QUEST_COMPLETION_MESSAGE,
       slopeQuestLabel: SLOPE_QUEST_LABEL,
       slopeQuestConfetti: SLOPE_QUEST_CONFETTI,
       debugSlopeQuest: DEBUG_SLOPE_QUEST,
@@ -651,19 +651,17 @@ test("slope quest confetti stays at or below the time-goal intensity (never larg
   assert.ok(hooks.slopeQuestConfetti.durationMs >= 1000 && hooks.slopeQuestConfetti.durationMs <= 1300);
 });
 
-test("resetting the adventure clears slope quest completion and pending-notification flags", () => {
+test("resetting the adventure clears the pending-notification flag (slopeQuest.completedThisSession reset timing is covered in slope-quest-lock.test.cjs: only selectAdventurePreset resets it, not this function)", () => {
   const { hooks } = loadProductionAdventure();
   hooks.adventureState.status = "active";
-  hooks.adventureState.slopeQuestCompleted = true;
   hooks.adventureState.slopeQuestNotificationPending = true;
 
   hooks.resetAdventureStateKeepHistory();
 
-  assert.equal(hooks.adventureState.slopeQuestCompleted, false);
   assert.equal(hooks.adventureState.slopeQuestNotificationPending, false);
 });
 
-test("completion data reports slopeQuestCompleted for both the reached and not-reached cases", () => {
+test("completion data reports slopeQuestCompleted (sourced from slopeQuest.completedThisSession) for both the reached and not-reached cases", () => {
   const { hooks } = loadProductionAdventure();
   Object.assign(hooks.adventureState, {
     preset: "short",
@@ -674,12 +672,12 @@ test("completion data reports slopeQuestCompleted for both the reached and not-r
     startedAt: 0,
     endedAt: 300000,
     goalReached: true,
-    slopeQuestCompleted: false,
     direction: null,
   });
+  hooks.adventureState.slopeQuest.completedThisSession = false;
   assert.equal(hooks.getAdventureCompletionData().slopeQuestCompleted, false);
 
-  hooks.adventureState.slopeQuestCompleted = true;
+  hooks.adventureState.slopeQuest.completedThisSession = true;
   assert.equal(hooks.getAdventureCompletionData().slopeQuestCompleted, true);
 });
 
@@ -699,9 +697,9 @@ test("slope quest wording avoids absolute steepness claims and uses candidate ph
   assert.equal(app.includes("勾配スポット"), true);
 });
 
-test("slope quest arrival message and log entry use the candidate label", () => {
+test("slope quest completion message (shown only on manual button press) and log entry use the candidate label", () => {
   const { hooks } = loadProductionAdventure();
-  assert.equal(hooks.slopeQuestArrivalMessage, "勾配スポットに到達！");
+  assert.equal(hooks.slopeQuestCompletionMessage, "勾配クエスト踏破！");
   assert.equal(hooks.slopeQuestLabel, "勾配スポット");
 });
 
@@ -725,7 +723,7 @@ test("completion sheet has exactly one slope-quest result badge, hidden by defau
   const badgeMatch = html.match(/<div[^>]*id="slope-quest-result-badge"[^>]*>/);
   assert.ok(badgeMatch);
   assert.equal(badgeMatch[0].includes("hidden"), true);
-  assert.equal(html.includes("勾配スポットに到達"), true);
+  assert.equal(html.includes("勾配スポットを踏破"), true);
 
   // 主要3項目の<ul>の中には無い（数値表へは入れない）
   const completionStats = html.match(/<ul class="completion-stats">([\s\S]*?)<\/ul>/);
@@ -752,9 +750,10 @@ test("slope quest marker is a flag (pole + cloth), not a circular pin, with a >=
   assert.equal(cloth[1].includes("clip-path"), true);
   assert.equal(css.includes(".slope-quest-marker.is-completing"), true);
   assert.equal(css.includes(".slope-quest-marker.is-completed"), true);
-  assert.equal(css.includes(".slope-quest-marker.is-removing"), true);
   assert.equal(css.includes("slope-quest-complete-pop"), true);
   assert.equal(css.includes("slope-quest-ring-pulse"), true);
+  // 達成後は旗を消さないため、削除演出(is-removing)は廃止されている
+  assert.equal(css.includes(".slope-quest-marker.is-removing"), false);
 });
 
 test("slope quest flag markup avoids emoji-only rendering and differs from the current-location marker's circular fill color", () => {
@@ -784,7 +783,7 @@ test("reduced-motion stops the ring pulse/pop and shortens notification transiti
 
 test("service worker cache version includes the updated app shell", () => {
   const sw = readFileSync(join(__dirname, "..", "sw.js"), "utf8");
-  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v29"'), true);
+  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v30"'), true);
   for (const asset of ["./index.html", "./styles.css", "./app.js"]) {
     assert.equal(sw.includes(`"${asset}"`), true, `missing ${asset}`);
   }

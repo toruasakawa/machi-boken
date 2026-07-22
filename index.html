@@ -46,6 +46,28 @@
   <button id="btn-end-adventure" class="adventure-end-btn" type="button">冒険を終える</button>
 </div>
 
+<!-- 勾配スポット踏破ボタン。GPS/セル接近判定は「表示してよいか」だけに使い、
+     自動達成はしない。全画面モーダルにはせず、地図のパン・ズームを妨げない。 -->
+<section
+  id="slope-quest-action-panel"
+  class="slope-quest-action-panel"
+  hidden
+>
+  <h3>勾配スポットの近くです</h3>
+
+  <p id="slope-quest-action-description">
+    坂を最後まで進んだら、踏破達成です。
+  </p>
+
+  <button
+    id="complete-slope-quest-button"
+    type="button"
+    aria-describedby="slope-quest-action-description"
+  >
+    坂を踏破した！
+  </button>
+</section>
+
 <!-- 初期時間の達成は操作を求めず、発見演出の後に短く知らせる -->
 <div
   id="time-goal-notification"
@@ -177,7 +199,7 @@
   </ul>
   <div id="slope-quest-result-badge" class="result-achievement-badge" hidden>
     <span aria-hidden="true">✓</span>
-    <span>勾配スポットに到達</span>
+    <span>勾配スポットを踏破</span>
   </div>
   <p id="completion-message" class="completion-message"></p>
   <button id="btn-show-achievement-card" class="share-trigger-btn" type="button">成果カードを見る</button>

@@ -440,6 +440,50 @@ body {
   font-size: 12px;
 }
 
+/* 勾配スポット踏破ボタン。地図の下部に固定するが、全画面モーダルにはせず
+   地図のパン・ズームは妨げない(この要素自体が画面全体を覆うことはない)。 */
+.slope-quest-action-panel {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 15;
+  background: var(--panel);
+  border-top: 1px solid var(--amber-dim);
+  border-radius: 18px 18px 0 0;
+  padding: 16px 20px max(18px, env(safe-area-inset-bottom));
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.35);
+}
+.slope-quest-action-panel[hidden] {
+  display: none;
+}
+.slope-quest-action-panel h3 {
+  margin: 0 0 6px;
+  font-size: 16px;
+  color: var(--amber);
+}
+.slope-quest-action-panel p {
+  margin: 0 0 14px;
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+#complete-slope-quest-button {
+  display: block;
+  width: 100%;
+  min-height: 48px; /* 44px以上、片手で押しやすい大きさ */
+  padding: 12px;
+  border: none;
+  border-radius: 10px;
+  background: var(--amber);
+  color: #111827;
+  font-size: 15px;
+  font-weight: 700;
+}
+#complete-slope-quest-button:disabled {
+  opacity: 0.5;
+}
+
 /* 時間達成は地図操作を止めず、初回だけ軽い通知として表示する。 */
 #time-goal-notification {
   position: fixed;
@@ -1250,8 +1294,10 @@ body {
   .slope-quest-marker.is-completing .slope-quest-marker__ring {
     animation: none;
   }
-  .slope-quest-marker.is-removing {
-    transition: none;
+  /* 接近中も呼吸は止めるが、状態自体(通常より明るい)は静的な値として残す */
+  .slope-quest-marker.is-nearby .slope-quest-marker__ring {
+    animation: none;
+    opacity: 0.6;
   }
 }
 
@@ -1344,7 +1390,25 @@ body {
     opacity: 0.3;
   }
 }
-/* チェック済み状態: リングの呼吸を止め、旗布の色を落ち着かせる（形はフラッグのまま） */
+/* 接近判定成立後(踏破ボタン表示中): 旗は同じ場所のまま、リングだけ少し明るくする。
+   呼吸パルス自体はslope-quest-ring-pulseのまま(既存のCSSアニメーションを差し替えず)、
+   明るさの範囲だけ広いキーフレームへ切り替える。 */
+.slope-quest-marker.is-nearby .slope-quest-marker__ring {
+  animation: slope-quest-ring-pulse-nearby 2.4s ease-in-out infinite;
+}
+@keyframes slope-quest-ring-pulse-nearby {
+  0%,
+  100% {
+    transform: scale(0.9);
+    opacity: 0.5;
+  }
+  50% {
+    transform: scale(1.15);
+    opacity: 0.85;
+  }
+}
+/* チェック済み状態: リングの呼吸を止め、旗布の色を落ち着かせる（形はフラッグのまま）。
+   達成後も旗は消さず、そのまま地図に残す。 */
 .slope-quest-marker.is-completed .slope-quest-marker__ring {
   animation: none;
   opacity: 0.2;
@@ -1353,9 +1417,37 @@ body {
   background: rgba(148, 163, 184, 0.65);
   color: #f8fafc;
 }
-.slope-quest-marker.is-removing {
-  transition: opacity 400ms ease-out;
-  opacity: 0;
+
+/* 過去に踏破済みの旗（別レイヤー）。今回の候補旗より小さく、リング・呼吸アニメーションなしの
+   落ち着いた達成済みデザイン。今回のクエスト対象にはしない（タップは簡易情報表示のみ）。 */
+.completed-slope-spot-marker {
+  position: relative;
+  width: 36px;
+  height: 36px;
+}
+.completed-slope-spot-marker__pole {
+  position: absolute;
+  left: 17px;
+  bottom: 2px;
+  width: 2px;
+  height: 22px;
+  background: rgba(148, 163, 184, 0.85);
+  border-radius: 1px;
+}
+.completed-slope-spot-marker__cloth {
+  position: absolute;
+  left: 19px;
+  top: 6px;
+  width: 16px;
+  height: 11px;
+  background: rgba(148, 163, 184, 0.75);
+  clip-path: polygon(0 0, 100% 32%, 0 68%);
+  color: #f8fafc;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 8px;
+  font-weight: 800;
 }
 
 /* Leaflet attribution (kept for OSM tile usage policy) */

@@ -25,8 +25,9 @@ function makeFailingFetch() {
   };
 }
 
-// drawQuestMarker()が実際にLeafletマーカーを生成した回数・座標を数えるための最小限のL/questLayer代替。
-// フラッグが「1冒険で最大1回だけ固定表示される」ことを検証する目的にのみ使う。
+// drawQuestMarker()/renderCompletedSlopeSpots()が実際にLeafletマーカーを生成した回数・座標を
+// 数えるための最小限のL/レイヤー代替。「候補は1冒険1つ・接近だけでは自動達成しない・
+// 踏破済み地点は恒久保存され次回以降も表示される」ことを検証する目的にのみ使う。
 function loadProductionAdventure(fetchImpl) {
   const appPath = join(__dirname, "..", "app.js");
   const source = readFileSync(appPath, "utf8");
@@ -41,15 +42,33 @@ function loadProductionAdventure(fetchImpl) {
       buildSlopeQuestArrivalDebugContext,
       selectAdventurePreset,
       resetAdventureStateKeepHistory,
+      endAdventure,
       cellIndex,
       cellKey,
+      isNearSlopeQuest,
+      markSlopeQuestArrivalEligible,
+      completeSlopeQuestManually,
+      isSameCompletedSlopeSpot,
+      sanitizeCompletedSlopeSpots,
+      dedupeCompletedSlopeSpots,
+      saveCompletedSlopeSpot,
+      isNearCompletedSlopeSpot,
+      renderCompletedSlopeSpots,
+      updateCompletedSlopeSpotsIfNeeded,
+      completedSlopeSpotDedupeDistanceM: COMPLETED_SLOPE_SPOT_DEDUPE_DISTANCE_M,
+      completedSlopeSpotRenderRadiusM: COMPLETED_SLOPE_SPOT_RENDER_RADIUS_M,
       setOrigin(o) { origin = o; },
       setLastReliablePosition(p) { lastReliablePosition = p; },
       getLastReliablePosition() { return lastReliablePosition; },
       setQuestLayer(layer) { questLayer = layer; },
+      setCompletedSlopeSpotsLayer(layer) { completedSlopeSpotsLayer = layer; },
       getQuestMarker() { return questMarker; },
       setSlopeQuestCompletionInProgress(v) { slopeQuestCompletionInProgress = v; },
       getSlopeQuestCompletionInProgress() { return slopeQuestCompletionInProgress; },
+      getCompletedSlopeSpots() { return completedSlopeSpots.map((s) => ({ ...s })); },
+      setCompletedSlopeSpots(spots) { completedSlopeSpots = spots; },
+      getCompletedSlopeSpotMarkerCount() { return completedSlopeSpotMarkersByCellId.size; },
+      getElementById(id) { return document.getElementById(id); },
       markAllRingCellsVisited(lat, lon) {
         const { ix: cix, iy: ciy } = cellIndex(lat, lon);
         for (let dx = -QUEST_RING_CELLS; dx <= QUEST_RING_CELLS; dx++) {
@@ -63,6 +82,7 @@ function loadProductionAdventure(fetchImpl) {
   `;
 
   const markerCreations = [];
+  const completedSpotMarkerCreations = [];
   const questLayerCalls = { clearLayers: 0 };
 
   function makeStubElement() {
@@ -84,6 +104,7 @@ function loadProductionAdventure(fetchImpl) {
       innerHTML: "",
       offsetWidth: 0,
       disabled: false,
+      hidden: false,
       appendChild: () => {},
       setAttribute: () => {},
       getAttribute: () => null,
@@ -95,16 +116,37 @@ function loadProductionAdventure(fetchImpl) {
     return el;
   }
 
+  // 同じidには常に同じスタブ要素を返す（production側とテスト側の両方が同じオブジェクトを見るように）。
+  const elementsById = new Map();
+  function getStubElement(id) {
+    if (!elementsById.has(id)) elementsById.set(id, makeStubElement());
+    return elementsById.get(id);
+  }
+
+  function makeFakeMarker(kind) {
+    const m = {
+      _handlers: {},
+      addTo: () => m,
+      on(event, handler) {
+        m._handlers[event] = handler;
+        return m;
+      },
+      getElement: () => null,
+      __fireClick() {
+        if (m._handlers.click) m._handlers.click({ latlng: { lat: 0, lng: 0 } });
+      },
+    };
+    return m;
+  }
+
   const fakeLeaflet = {
     divIcon: (opts) => ({ __divIcon: true, opts }),
     marker: (latlng, opts) => {
-      markerCreations.push({ lat: latlng[0], lng: latlng[1] });
-      const m = {
-        addTo: () => m,
-        on: () => m,
-        getElement: () => null,
-      };
-      return m;
+      const isCompletedSpot = opts && opts.pane === "completedSlopeSpotsPane";
+      const entry = { lat: latlng[0], lng: latlng[1] };
+      if (isCompletedSpot) completedSpotMarkerCreations.push(entry);
+      else markerCreations.push(entry);
+      return makeFakeMarker(isCompletedSpot ? "completed" : "quest");
     },
   };
 
@@ -112,6 +154,10 @@ function loadProductionAdventure(fetchImpl) {
     clearLayers: () => {
       questLayerCalls.clearLayers += 1;
     },
+  };
+  const completedSlopeSpotsLayerStub = {
+    addLayer: () => {},
+    removeLayer: () => {},
   };
 
   const context = vm.createContext({
@@ -122,6 +168,8 @@ function loadProductionAdventure(fetchImpl) {
     Promise,
     URLSearchParams,
     JSON,
+    Set,
+    Array,
     clearInterval: () => {},
     clearTimeout: () => {},
     setTimeout: () => 1, // 発火はさせない。同期的に検証できる範囲だけをテストする
@@ -134,7 +182,7 @@ function loadProductionAdventure(fetchImpl) {
       })(),
     },
     document: {
-      getElementById: () => makeStubElement(),
+      getElementById: (id) => getStubElement(id),
       createElement: () => makeStubElement(),
     },
     fetch: (...args) => fetchImpl(...args),
@@ -148,7 +196,7 @@ function loadProductionAdventure(fetchImpl) {
     cancelAnimationFrame: () => {},
     window: {
       addEventListener: () => {},
-      // 紙吹雪(spawnConfetti)はreduced-motionで即return するため、
+      // 紙吹雪(spawnConfetti)はreduced-motionで即returnするため、
       // document.createElementの詳細な形まで作り込まずに済ませる。
       matchMedia: () => ({ matches: true }),
     },
@@ -158,7 +206,8 @@ function loadProductionAdventure(fetchImpl) {
   vm.runInContext(`${source}\n${exposeTestHooks}`, context, { filename: appPath });
   const hooks = context.__slopeQuestTestHooks;
   hooks.setQuestLayer(questLayerStub);
-  return { hooks, markerCreations, questLayerCalls };
+  hooks.setCompletedSlopeSpotsLayer(completedSlopeSpotsLayerStub);
+  return { hooks, markerCreations, completedSpotMarkerCreations, questLayerCalls };
 }
 
 function activateAdventure(hooks) {
@@ -167,7 +216,7 @@ function activateAdventure(hooks) {
   hooks.setLastReliablePosition({ lat: TOKYO.lat0, lon: TOKYO.lon0 });
 }
 
-/* ---------- ensureQuest(): 生成条件・ロック ---------- */
+/* ---------- ensureQuest(): 生成条件・ロック（1冒険1候補・固定は変更しない） ---------- */
 
 test("ensureQuest does nothing while the adventure is not active", async () => {
   const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
@@ -203,6 +252,8 @@ test("ensureQuest generates exactly one candidate and locks the flag (status -> 
   assert.equal(typeof hooks.adventureState.slopeQuest.lat, "number");
   assert.equal(typeof hooks.adventureState.slopeQuest.lng, "number");
   assert.ok(hooks.adventureState.slopeQuest.cellId);
+  assert.equal(hooks.adventureState.slopeQuest.arrivalEligible, false);
+  assert.equal(hooks.adventureState.slopeQuest.completedThisSession, false);
   assert.equal(markerCreations.length, 1);
 });
 
@@ -250,7 +301,7 @@ test("elevation API failure still adopts the existing nearest-distance fallback 
   assert.equal(markerCreations.length, 1);
 });
 
-/* ---------- 非同期応答の競合防止 ---------- */
+/* ---------- 非同期応答の競合防止（変更しない） ---------- */
 
 test("a stale requestId (superseded before the response arrives) is discarded and does not overwrite the locked state", async () => {
   let resolveFetch;
@@ -319,7 +370,7 @@ test("a response that arrives after the adventure already ended (status no longe
   assert.equal(markerCreations.length, 0);
 });
 
-/* ---------- drawQuestMarker(): 保存済みの座標だけを描画する ---------- */
+/* ---------- drawQuestMarker(): 保存済みの座標だけを描画する（変更しない） ---------- */
 
 test("drawQuestMarker only ever reads from adventureState.slopeQuest, never from a passed-in candidate", () => {
   const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
@@ -335,7 +386,7 @@ test("drawQuestMarker only ever reads from adventureState.slopeQuest, never from
   assert.equal(markerCreations[0].lng, 139.8);
 });
 
-test("drawQuestMarker does nothing when there is no ready/completed candidate to show", () => {
+test("drawQuestMarker does nothing when there is no ready/nearby/completed candidate to show", () => {
   const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
   hooks.adventureState.slopeQuest.status = "idle";
   hooks.drawQuestMarker();
@@ -350,25 +401,123 @@ test("drawQuestMarker does nothing when there is no ready/completed candidate to
   assert.equal(markerCreations.length, 0);
 });
 
-/* ---------- 到達・冒険終了 ---------- */
+test("drawQuestMarker also draws for the nearby status (candidate stays visible while the completion button is shown)", () => {
+  const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
+  hooks.adventureState.slopeQuest.status = "nearby";
+  hooks.adventureState.slopeQuest.lat = 35.7;
+  hooks.adventureState.slopeQuest.lng = 139.8;
+  hooks.adventureState.slopeQuest.cellId = "1_1";
 
-test("triggerSlopeQuestCompletion marks the quest completed exactly once and does not draw a new marker", () => {
+  hooks.drawQuestMarker();
+
+  assert.equal(markerCreations.length, 1);
+});
+
+/* ---------- 接近判定: 「踏破ボタンを表示してよいか」だけを決める。自動達成しない ---------- */
+
+test("isNearSlopeQuest uses the same same-cell rule and is true for ready/nearby, false otherwise", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  hooks.adventureState.slopeQuest.status = "ready";
+  hooks.adventureState.slopeQuest.cellId = "5_5";
+  assert.equal(hooks.isNearSlopeQuest("5_5"), true);
+  assert.equal(hooks.isNearSlopeQuest("9_9"), false);
+
+  hooks.adventureState.slopeQuest.status = "completed";
+  assert.equal(hooks.isNearSlopeQuest("5_5"), false); // completedはこの判定の対象外(既に確定済み)
+});
+
+test("markSlopeQuestArrivalEligible sets arrivalEligible+status=nearby, shows the action panel, but does NOT auto-complete, save, or vibrate/confetti", () => {
   const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
   hooks.setOrigin(TOKYO);
   hooks.adventureState.slopeQuest.status = "ready";
+  hooks.adventureState.slopeQuest.lat = TOKYO.lat0;
+  hooks.adventureState.slopeQuest.lng = TOKYO.lon0;
+  hooks.adventureState.slopeQuest.cellId = "1_1";
+  hooks.drawQuestMarker(); // 旗を用意しておく(is-nearbyクラス付与の対象にするため)
+
+  hooks.markSlopeQuestArrivalEligible(TOKYO.lat0, TOKYO.lon0);
+
+  assert.equal(hooks.adventureState.slopeQuest.arrivalEligible, true);
+  assert.equal(hooks.adventureState.slopeQuest.status, "nearby");
+  assert.equal(hooks.adventureState.slopeQuest.completedThisSession, false);
+  assert.equal(hooks.getCompletedSlopeSpots().length, 0); // 保存されていない
+  assert.equal(hooks.getElementById("slope-quest-action-panel").hidden, false);
+  assert.equal(markerCreations.length, 1); // 再描画されていない(同じ旗のまま)
+
+  // 一度trueになったら、再度呼んでも状態は変わらない(冪等)
+  hooks.markSlopeQuestArrivalEligible(TOKYO.lat0 + 1, TOKYO.lon0 + 1);
+  assert.equal(hooks.adventureState.slopeQuest.status, "nearby");
+});
+
+/* ---------- 踏破ボタン: ユーザーが押したときだけ達成が確定する ---------- */
+
+test("completeSlopeQuestManually does nothing unless active + arrivalEligible + not already completed", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+
+  // 冒険中でない
+  hooks.adventureState.status = "idle";
+  hooks.adventureState.slopeQuest.arrivalEligible = true;
+  hooks.completeSlopeQuestManually();
+  assert.equal(hooks.adventureState.slopeQuest.completedThisSession, false);
+
+  // 接近判定が成立していない(ボタンはそもそも表示されていないはずだが、直接呼ばれても無視する)
+  hooks.adventureState.status = "active";
+  hooks.adventureState.slopeQuest.arrivalEligible = false;
+  hooks.completeSlopeQuestManually();
+  assert.equal(hooks.adventureState.slopeQuest.completedThisSession, false);
+});
+
+test("completeSlopeQuestManually confirms completion exactly once, disables the button, hides the panel, and saves the spot", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  hooks.setOrigin(TOKYO);
+  hooks.adventureState.status = "active";
+  hooks.adventureState.slopeQuest.status = "nearby";
+  hooks.adventureState.slopeQuest.arrivalEligible = true;
+  hooks.adventureState.slopeQuest.lat = TOKYO.lat0;
+  hooks.adventureState.slopeQuest.lng = TOKYO.lon0;
+  hooks.adventureState.slopeQuest.cellId = "3_3";
+  hooks.adventureState.slopeQuest.score = 4.2;
+
+  hooks.completeSlopeQuestManually();
+
+  assert.equal(hooks.adventureState.slopeQuest.completedThisSession, true);
+  assert.equal(hooks.adventureState.slopeQuest.status, "completed");
+  assert.equal(hooks.getElementById("complete-slope-quest-button").disabled, true);
+  assert.equal(hooks.getElementById("slope-quest-action-panel").hidden, true);
+  const saved = hooks.getCompletedSlopeSpots();
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].cellId, "3_3");
+  assert.equal(saved[0].lat, TOKYO.lat0);
+  assert.equal(saved[0].lng, TOKYO.lon0);
+  assert.ok(Number.isFinite(saved[0].completedAt));
+
+  // 多重タップ: 2回目は何も変わらない(重複保存もされない)
+  hooks.completeSlopeQuestManually();
+  assert.equal(hooks.getCompletedSlopeSpots().length, 1);
+});
+
+/* ---------- 到達演出(triggerSlopeQuestCompletion): 押下後の演出のみを担当する ---------- */
+
+test("triggerSlopeQuestCompletion plays the completion effect exactly once and never draws a new marker (flag is not removed)", () => {
+  const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
+  hooks.setOrigin(TOKYO);
+  hooks.adventureState.slopeQuest.status = "completed";
   hooks.adventureState.slopeQuest.lat = 35.7;
   hooks.adventureState.slopeQuest.lng = 139.8;
   hooks.adventureState.slopeQuest.cellId = "1_1";
   hooks.adventureState.slopeQuest.score = 4.2;
+  hooks.adventureState.slopeQuest.completedThisSession = true;
 
-  hooks.triggerSlopeQuestCompletion(35.7, 139.8);
-  assert.equal(hooks.adventureState.slopeQuest.status, "completed");
-  assert.equal(hooks.adventureState.slopeQuestCompleted, true);
-  assert.equal(markerCreations.length, 0); // 到達演出はマーカーを再生成しない(既存のDOM操作のみ)
+  hooks.triggerSlopeQuestCompletion({
+    savedSpotId: "slope-1_1",
+    savedSpotCellId: "1_1",
+    persistedSuccessfully: true,
+  });
+  assert.equal(hooks.getSlopeQuestCompletionInProgress(), true); // 演出中(setTimeoutは発火させていない)
+  assert.equal(markerCreations.length, 0); // 演出はマーカーを再生成しない(既存のDOM操作のみ)
 
-  // 二重到達: 何も変わらない
-  hooks.triggerSlopeQuestCompletion(35.7, 139.8);
-  assert.equal(hooks.adventureState.slopeQuest.status, "completed");
+  // 多重呼び出し対策: 演出中の2回目は無視される
+  hooks.triggerSlopeQuestCompletion({ savedSpotId: "x", savedSpotCellId: "x", persistedSuccessfully: true });
 });
 
 test("after completion, ensureQuest never starts a new search for the rest of the adventure", async () => {
@@ -385,6 +534,8 @@ test("after completion, ensureQuest never starts a new search for the rest of th
   assert.equal(markerCreations.length, 0);
 });
 
+/* ---------- 冒険終了: 未踏破なら消す、踏破済みなら残す ---------- */
+
 test("retireSlopeQuestMarkerForEndOfAdventure clears the map layer, unless the arrival animation is still playing", () => {
   const { hooks, questLayerCalls } = loadProductionAdventure(makeSuccessFetch());
 
@@ -397,17 +548,37 @@ test("retireSlopeQuestMarkerForEndOfAdventure clears the map layer, unless the a
   assert.equal(questLayerCalls.clearLayers, 1); // 演出中は消さない(既存の到達演出を優先する)
 });
 
+test("endAdventure keeps the flag on the map when this session's quest was completed, but retires it when it was not", () => {
+  const successCase = loadProductionAdventure(makeSuccessFetch());
+  activateAdventure(successCase.hooks);
+  successCase.hooks.adventureState.startedAt = Date.now() - 1000;
+  successCase.hooks.adventureState.slopeQuest.status = "completed";
+  successCase.hooks.adventureState.slopeQuest.completedThisSession = true;
+  successCase.hooks.endAdventure();
+  assert.equal(successCase.questLayerCalls.clearLayers, 0); // 踏破済みなら消さない
+
+  const notCompletedCase = loadProductionAdventure(makeSuccessFetch());
+  activateAdventure(notCompletedCase.hooks);
+  notCompletedCase.hooks.adventureState.startedAt = Date.now() - 1000;
+  notCompletedCase.hooks.adventureState.slopeQuest.status = "nearby";
+  notCompletedCase.hooks.adventureState.slopeQuest.completedThisSession = false;
+  notCompletedCase.hooks.endAdventure();
+  assert.equal(notCompletedCase.questLayerCalls.clearLayers, 1); // 未踏破なら消す
+});
+
 /* ---------- リセット: 新しい冒険開始時だけ ---------- */
 
-test("selectAdventurePreset resets slopeQuest to idle for a new adventure", () => {
+test("selectAdventurePreset resets slopeQuest (including arrivalEligible/completedThisSession) to idle for a new adventure", () => {
   const { hooks } = loadProductionAdventure(makeSuccessFetch());
   hooks.adventureState.slopeQuest = {
-    status: "ready",
+    status: "completed",
     lat: 1,
     lng: 2,
     cellId: "0_0",
     score: 3,
     requestId: "abc",
+    arrivalEligible: true,
+    completedThisSession: true,
   };
 
   hooks.selectAdventurePreset("short");
@@ -420,6 +591,19 @@ test("selectAdventurePreset resets slopeQuest to idle for a new adventure", () =
   assert.equal(q.cellId, null);
   assert.equal(q.score, null);
   assert.equal(q.requestId, null);
+  assert.equal(q.arrivalEligible, false);
+  assert.equal(q.completedThisSession, false);
+});
+
+test("selectAdventurePreset never touches the permanently-saved completedSlopeSpots", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  hooks.setCompletedSlopeSpots([
+    { id: "slope-1_1", lat: 1, lng: 2, cellId: "1_1", completedAt: 100 },
+  ]);
+
+  hooks.selectAdventurePreset("short");
+
+  assert.equal(hooks.getCompletedSlopeSpots().length, 1);
 });
 
 test("resetAdventureStateKeepHistory (end-of-adventure return to idle) does NOT reset slopeQuest itself, only selectAdventurePreset (new adventure) does", () => {
@@ -431,14 +615,153 @@ test("resetAdventureStateKeepHistory (end-of-adventure return to idle) does NOT 
     cellId: "0_0",
     score: 3,
     requestId: "abc",
+    arrivalEligible: true,
+    completedThisSession: true,
   };
 
   hooks.resetAdventureStateKeepHistory();
 
   assert.equal(hooks.adventureState.slopeQuest.status, "completed");
+  assert.equal(hooks.adventureState.slopeQuest.completedThisSession, true);
 });
 
-/* ---------- buildSlopeQuestArrivalDebugContext ---------- */
+/* ---------- 踏破済み地点の恒久保存: 重複防止 ---------- */
+
+test("isSameCompletedSlopeSpot matches on identical cellId, or within the dedupe distance", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  const a = { lat: TOKYO.lat0, lng: TOKYO.lon0, cellId: "1_1" };
+  const sameCellDifferentCoords = { lat: TOKYO.lat0 + 0.5, lng: TOKYO.lon0 + 0.5, cellId: "1_1" };
+  assert.equal(hooks.isSameCompletedSlopeSpot(a, sameCellDifferentCoords), true);
+
+  const closeButDifferentCell = { lat: TOKYO.lat0 + 0.0005, lng: TOKYO.lon0, cellId: "1_2" };
+  assert.equal(hooks.isSameCompletedSlopeSpot(a, closeButDifferentCell), true); // 距離が近い
+
+  const farAway = { lat: TOKYO.lat0 + 0.05, lng: TOKYO.lon0 + 0.05, cellId: "9_9" };
+  assert.equal(hooks.isSameCompletedSlopeSpot(a, farAway), false);
+});
+
+test("saveCompletedSlopeSpot does not create a duplicate entry for the same spot", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  const quest = { lat: TOKYO.lat0, lng: TOKYO.lon0, cellId: "4_4", score: 3 };
+
+  hooks.saveCompletedSlopeSpot(quest);
+  hooks.saveCompletedSlopeSpot(quest);
+  hooks.saveCompletedSlopeSpot({ ...quest, lat: quest.lat + 0.0001 }); // ほぼ同じ地点
+
+  assert.equal(hooks.getCompletedSlopeSpots().length, 1);
+});
+
+test("sanitizeCompletedSlopeSpots drops malformed entries without throwing (corrupt localStorage does not stop the app)", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  const raw = [
+    { lat: 35.1, lng: 139.1, cellId: "1_1", completedAt: 100 }, // valid
+    { lat: "not-a-number", lng: 139.1, cellId: "2_2" }, // invalid lat
+    { lat: 35.1, lng: 139.1 }, // no cellId/id
+    null,
+    "garbage",
+    42,
+    { lat: 35.2, lng: 139.2, id: "x", completedAt: "not-a-number" }, // invalid completedAt
+  ];
+  const cleaned = hooks.sanitizeCompletedSlopeSpots(raw);
+  assert.equal(cleaned.length, 1);
+  assert.equal(cleaned[0].cellId, "1_1");
+});
+
+test("sanitizeCompletedSlopeSpots returns an empty array for non-array input (e.g. corrupt JSON parse fallback)", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  // VM越しの配列はプロトタイプが異なるためdeepStrictEqualではなくlengthで比較する。
+  assert.equal(hooks.sanitizeCompletedSlopeSpots(null).length, 0);
+  assert.equal(hooks.sanitizeCompletedSlopeSpots(undefined).length, 0);
+  assert.equal(hooks.sanitizeCompletedSlopeSpots({}).length, 0);
+});
+
+test("dedupeCompletedSlopeSpots collapses duplicates found in stored data (e.g. from manual edits or past bugs)", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  const spots = [
+    { id: "a", lat: 35.1, lng: 139.1, cellId: "1_1", completedAt: 100 },
+    { id: "b", lat: 35.1, lng: 139.1, cellId: "1_1", completedAt: 200 },
+    { id: "c", lat: 36.1, lng: 140.1, cellId: "9_9", completedAt: 300 },
+  ];
+  const result = hooks.dedupeCompletedSlopeSpots(spots);
+  assert.equal(result.length, 2);
+});
+
+/* ---------- 新しい候補選定からの踏破済み地点の除外（後段フィルター。順位計算は変更しない） ---------- */
+
+test("generateQuest (via ensureQuest) excludes cells that match a completed spot's cellId or distance, without touching the ranking formula", async () => {
+  const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
+  activateAdventure(hooks);
+  const { ix, iy } = hooks.cellIndex(TOKYO.lat0, TOKYO.lon0);
+  // 標高が最も高くなる(=最良候補になる)セルをあらかじめ踏破済みとして登録しておく。
+  // generateQuest()自体のランキング式(gradientPct計算・ソート)は一切変更していないため、
+  // 「除外していなければ選ばれていたはずの最良候補」がちゃんと除外されることを確認する。
+  const bestCandidateCellId = hooks.cellKey(ix, iy + 4); // dx=0,dy=4は候補ループの3番目に相当(既存のmakeSuccessFetchのi===3と対応)
+  hooks.setCompletedSlopeSpots([
+    { id: `slope-${bestCandidateCellId}`, lat: 0, lng: 0, cellId: bestCandidateCellId, completedAt: 1 },
+  ]);
+
+  await hooks.ensureQuest();
+
+  assert.equal(hooks.adventureState.slopeQuest.status, "ready");
+  assert.notEqual(hooks.adventureState.slopeQuest.cellId, bestCandidateCellId);
+  assert.equal(markerCreations.length, 1);
+});
+
+test("isNearCompletedSlopeSpot reflects the same same-cellId-or-distance rule used for saving", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  hooks.setCompletedSlopeSpots([
+    { id: "slope-1_1", lat: TOKYO.lat0, lng: TOKYO.lon0, cellId: "1_1", completedAt: 1 },
+  ]);
+  assert.equal(hooks.isNearCompletedSlopeSpot(TOKYO.lat0, TOKYO.lon0, "1_1"), true);
+  assert.equal(hooks.isNearCompletedSlopeSpot(35.9, 140.9, "9_9"), false);
+});
+
+/* ---------- 過去に踏破済みの旗: 今回のクエスト旗とは別レイヤーで、現在地周辺だけ描画する ---------- */
+
+test("renderCompletedSlopeSpots only draws spots within the render radius, on the dedicated layer/pane", () => {
+  const { hooks, completedSpotMarkerCreations } = loadProductionAdventure(makeSuccessFetch());
+  hooks.setCompletedSlopeSpots([
+    { id: "near", lat: TOKYO.lat0 + 0.001, lng: TOKYO.lon0 + 0.001, cellId: "1_1", completedAt: 1 },
+    { id: "far", lat: TOKYO.lat0 + 5, lng: TOKYO.lon0 + 5, cellId: "999_999", completedAt: 2 },
+  ]);
+
+  hooks.renderCompletedSlopeSpots(TOKYO.lat0, TOKYO.lon0);
+
+  assert.equal(completedSpotMarkerCreations.length, 1);
+  assert.equal(hooks.getCompletedSlopeSpotMarkerCount(), 1);
+});
+
+test("renderCompletedSlopeSpots excludes this session's own candidate (questLayer already shows it, avoiding a duplicate flag)", () => {
+  const { hooks, completedSpotMarkerCreations } = loadProductionAdventure(makeSuccessFetch());
+  hooks.adventureState.slopeQuest.status = "ready";
+  hooks.adventureState.slopeQuest.cellId = "own-cell";
+  hooks.setCompletedSlopeSpots([
+    { id: "own", lat: TOKYO.lat0, lng: TOKYO.lon0, cellId: "own-cell", completedAt: 1 },
+    { id: "other", lat: TOKYO.lat0 + 0.001, lng: TOKYO.lon0 + 0.001, cellId: "other-cell", completedAt: 2 },
+  ]);
+
+  hooks.renderCompletedSlopeSpots(TOKYO.lat0, TOKYO.lon0);
+
+  assert.equal(completedSpotMarkerCreations.length, 1);
+  assert.equal(completedSpotMarkerCreations[0].lat, TOKYO.lat0 + 0.001);
+});
+
+test("updateCompletedSlopeSpotsIfNeeded only recomputes when the center cell actually changes (debounced like fog)", () => {
+  const { hooks, completedSpotMarkerCreations } = loadProductionAdventure(makeSuccessFetch());
+  hooks.setOrigin(TOKYO);
+  hooks.setCompletedSlopeSpots([
+    { id: "near", lat: TOKYO.lat0, lng: TOKYO.lon0, cellId: "1_1", completedAt: 1 },
+  ]);
+
+  hooks.updateCompletedSlopeSpotsIfNeeded(TOKYO.lat0, TOKYO.lon0);
+  assert.equal(completedSpotMarkerCreations.length, 1);
+
+  // 同じセル内での移動: 再計算されない(マーカーが再生成されない)
+  hooks.updateCompletedSlopeSpotsIfNeeded(TOKYO.lat0 + 0.00001, TOKYO.lon0);
+  assert.equal(completedSpotMarkerCreations.length, 1);
+});
+
+/* ---------- buildSlopeQuestArrivalDebugContext（変更しない） ---------- */
 
 test("buildSlopeQuestArrivalDebugContext compares the current cell against adventureState.slopeQuest.cellId", () => {
   const { hooks } = loadProductionAdventure(makeSuccessFetch());
@@ -475,12 +798,27 @@ test("ensureQuest's stale-response guard reports every reason string from the sp
   }
 });
 
-test("the arrival check in handlePosition uses adventureState.slopeQuest (status===ready + same cellId), not the old free-floating quest variable", () => {
-  assert.equal(
-    appSource.includes('adventureState.slopeQuest.status === "ready" &&'),
-    true,
+test("the arrival check in handlePosition only sets arrivalEligible/nearby, it does not call triggerSlopeQuestCompletion directly (no auto-completion)", () => {
+  const arrivalBlock = appSource.match(
+    /if \(!adventureState\.slopeQuest\.arrivalEligible[\s\S]*?markSlopeQuestArrivalEligible\(lat, lon\);\s*\n\s*\}/,
   );
-  assert.equal(appSource.includes("adventureState.slopeQuest.cellId === key"), true);
+  assert.ok(arrivalBlock, "arrival-eligible block not found in handlePosition");
+  assert.equal(arrivalBlock[0].includes("triggerSlopeQuestCompletion"), false);
+});
+
+test("completeSlopeQuestManually is the only call site of triggerSlopeQuestCompletion (completion is button-driven only)", () => {
+  const callSites = appSource.match(/triggerSlopeQuestCompletion\(/g) || [];
+  // 定義自体(function宣言)を含めて2箇所だけ: 関数定義 + completeSlopeQuestManually内の呼び出し
+  assert.equal(callSites.length, 2);
+  const fn = appSource.match(/function completeSlopeQuestManually\(\)[\s\S]*?\n}\n/)[0];
+  assert.equal(fn.includes("triggerSlopeQuestCompletion(saveResult)"), true);
+});
+
+test("the removed auto-completion behaviors are gone: no arrival-triggered confetti/vibration/message, no auto-remove-after-hold timer", () => {
+  assert.equal(appSource.includes("SLOPE_QUEST_ARRIVAL_MESSAGE"), false);
+  assert.equal(appSource.includes("holdCompletedMs"), false);
+  assert.equal(appSource.includes("removeFadeMs"), false);
+  assert.equal(appSource.includes("function removeSlopeQuestMarker"), false);
 });
 
 test("the old am_quest localStorage key is no longer defined as an active STORAGE_KEYS entry, and the free-floating quest variable is gone", () => {
@@ -489,12 +827,18 @@ test("the old am_quest localStorage key is no longer defined as an active STORAG
   assert.equal(appSource.includes("STORAGE_KEYS.quest"), false);
 });
 
-test("endAdventure retires the slope-quest marker", () => {
+test("am_completed_slope_spots is registered as an active STORAGE_KEYS entry", () => {
+  assert.equal(appSource.includes('completedSlopeSpots: "am_completed_slope_spots"'), true);
+});
+
+test("endAdventure hides the action panel and conditionally retires the slope-quest marker", () => {
   const fn = appSource.match(/function endAdventure\(\)[\s\S]*?\n}\n/)[0];
+  assert.equal(fn.includes("hideSlopeQuestActionPanel()"), true);
   assert.equal(fn.includes("retireSlopeQuestMarkerForEndOfAdventure()"), true);
+  assert.equal(fn.includes("completedThisSession"), true);
 });
 
 test("service worker cache version was bumped for this fix", () => {
   const sw = readFileSync(join(__dirname, "..", "sw.js"), "utf8");
-  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v29"'), true);
+  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v30"'), true);
 });

@@ -350,6 +350,7 @@ function isNearCompletedSlopeSpot(lat, lng, cellId) {
 
 // 踏破ボタン押下時にだけ呼ばれる。同じ地点(同一cellId、または近すぎる地点)は重複保存しない。
 function saveCompletedSlopeSpot(quest) {
+  const completedSlopeSpotCountBefore = completedSlopeSpots.length;
   const candidate = {
     id: `slope-${quest.cellId || `${quest.lat.toFixed(6)}_${quest.lng.toFixed(6)}`}`,
     lat: quest.lat,
@@ -374,6 +375,8 @@ function saveCompletedSlopeSpot(quest) {
     savedSpotId: candidate.id,
     savedSpotCellId: candidate.cellId,
     persistedSuccessfully,
+    completedSlopeSpotCountBefore,
+    completedSlopeSpotCountAfter: completedSlopeSpots.length,
   };
 }
 
@@ -609,8 +612,18 @@ function drawQuestMarker() {
     logSlopeQuestDebug("marker-redraw-deferred", { questCellId: q.cellId });
     return;
   }
-  questLayer.clearLayers();
-  clearSlopeQuestCompletionTimers();
+
+  // 1冒険1候補の座標は固定なので、既存旗がある場合はレイヤーを消去・再生成せず、
+  // ready/nearby/completedの見た目だけを更新する。接近時や遅延した再描画要求で
+  // 一瞬でも旗が消える経路を作らないための防御である。
+  if (questMarker) {
+    applySlopeQuestMarkerVisualState(q.status);
+    logSlopeQuestStateReview("marker-rendered", {
+      markerRedrawReason: "existing-marker-state-update",
+    });
+    return;
+  }
+
   const icon = L.divIcon({
     className: "slope-quest-marker",
     html: buildSlopeQuestIconHtml(q.status === "completed"),
@@ -627,12 +640,10 @@ function drawQuestMarker() {
     }
     openQuestPanel();
   });
-  const element = questMarker.getElement();
-  if (element) {
-    if (q.status === "nearby") element.classList.add("is-nearby");
-    if (q.status === "completed") element.classList.add("is-completed");
-    element.setAttribute("aria-label", getSlopeQuestAriaLabel(q.status));
-  }
+  applySlopeQuestMarkerVisualState(q.status);
+  logSlopeQuestStateReview("marker-rendered", {
+    markerRedrawReason: "candidate-created",
+  });
 }
 
 // 冒険終了時、今回未踏破のまま終わった場合だけ地図からフラッグを外す（踏破済みなら消さず、
@@ -642,15 +653,29 @@ function retireSlopeQuestMarkerForEndOfAdventure() {
   if (slopeQuestCompletionInProgress) return;
   if (questLayer) questLayer.clearLayers();
   questMarker = null;
+  logSlopeQuestStateReview("marker-removed", {
+    removeSlopeQuestMarkerCalled: true,
+    questLayerCleared: true,
+    markerRedrawReason: "adventure-ended-without-completion",
+  });
 }
 
-// 旗を同じ場所に残したまま、リングだけ少し明るくしaria-labelを更新する（再描画しない）。
-function applySlopeQuestNearbyState() {
+// 旗を同じ場所に残したまま、状態に応じてリング・チェック・aria-labelだけを更新する。
+// Leafletマーカー自体は作り直さないため、座標もタップハンドラも維持される。
+function applySlopeQuestMarkerVisualState(status) {
   if (!questMarker) return;
   const element = questMarker.getElement();
   if (!element) return;
-  element.classList.add("is-nearby");
-  element.setAttribute("aria-label", getSlopeQuestAriaLabel("nearby"));
+  element.classList.remove("is-nearby", "is-completed");
+  if (status === "nearby") element.classList.add("is-nearby");
+  if (status === "completed") element.classList.add("is-completed");
+  element.innerHTML = buildSlopeQuestIconHtml(status === "completed");
+  element.setAttribute("aria-label", getSlopeQuestAriaLabel(status));
+}
+
+// 接近時は同じ旗のリングだけを強め、達成済み表示にはしない。
+function applySlopeQuestNearbyState() {
+  applySlopeQuestMarkerVisualState("nearby");
 }
 
 function showSlopeQuestActionPanel() {
@@ -674,6 +699,21 @@ function isNearSlopeQuest(currentCellId) {
   return (q.status === "ready" || q.status === "nearby") && q.cellId === currentCellId;
 }
 
+// GPS更新から呼ぶ接近状態の唯一の入口。ここでは到達資格を付けるだけで、保存・演出・
+// completedへの遷移は行わない。戻り値は、この更新で初めて接近状態になったかどうか。
+function handleSlopeQuestProximity(currentCellId, curLat, curLon) {
+  logSlopeQuestStateReview("gps-update", { currentCellId });
+  if (adventureState.slopeQuest.arrivalEligible) return false;
+  if (!isNearSlopeQuest(currentCellId)) return false;
+
+  logSlopeQuestStateReview("entered-quest-cell", {
+    currentCellId,
+    markArrivalEligibleCalled: false,
+  });
+  markSlopeQuestArrivalEligible(curLat, curLon);
+  return true;
+}
+
 // 一度接近判定が成立したら、GPS揺れ・セル境界で一時的にfalseへ戻っても踏破ボタンを消さない。
 // ユーザーが踏破する／冒険を終える／新しい冒険を開始するまでarrivalEligibleは維持する。
 function markSlopeQuestArrivalEligible(curLat, curLon) {
@@ -683,6 +723,10 @@ function markSlopeQuestArrivalEligible(curLat, curLon) {
   q.status = "nearby";
   applySlopeQuestNearbyState();
   showSlopeQuestActionPanel();
+  logSlopeQuestStateReview("arrival-eligible", {
+    ...buildSlopeQuestArrivalDebugContext(curLat, curLon),
+    markArrivalEligibleCalled: true,
+  });
   logSlopeQuestPersistenceDebug({
     ...buildSlopeQuestArrivalDebugContext(curLat, curLon),
     markerRedrawReason: "arrival-eligible",
@@ -694,6 +738,11 @@ function markSlopeQuestArrivalEligible(curLat, curLon) {
 // ボタン無効化とcompletedThisSessionガードの両方で防ぐ。
 function completeSlopeQuestManually() {
   const quest = adventureState.slopeQuest;
+
+  logSlopeQuestStateReview("manual-completion-click", {
+    completionButtonPressed: true,
+    completeSlopeQuestManuallyCalled: true,
+  });
 
   if (adventureState.status !== "active") return;
   if (!quest.arrivalEligible) return;
@@ -707,6 +756,13 @@ function completeSlopeQuestManually() {
   hideSlopeQuestActionPanel();
 
   const saveResult = saveCompletedSlopeSpot(quest);
+  logSlopeQuestStateReview("manual-completion-saved", {
+    completionButtonPressed: true,
+    completeSlopeQuestManuallyCalled: true,
+    saveCompletedSlopeSpotCalled: true,
+    completedSlopeSpotCountBefore: saveResult.completedSlopeSpotCountBefore,
+    completedSlopeSpotCountAfter: saveResult.completedSlopeSpotCountAfter,
+  });
   triggerSlopeQuestCompletion(saveResult);
 }
 
@@ -1426,6 +1482,17 @@ const adventureState = {
 };
 let adventureFeedbackTimerIds = [];
 let adventureTimerId = null;
+let serviceWorkerRefreshPending = false;
+let reloadingForServiceWorkerUpdate = false;
+
+// 更新版Service Workerが制御を引き継いでも、冒険中や成果確認中の画面は突然再読込しない。
+// 次にidleへ戻った時点だけ、安全に新しいアプリシェルを読み直す。
+function reloadForServiceWorkerUpdateIfSafe() {
+  if (!serviceWorkerRefreshPending || reloadingForServiceWorkerUpdate) return;
+  if (adventureState.status !== "idle") return;
+  reloadingForServiceWorkerUpdate = true;
+  window.location.reload();
+}
 
 function clearAdventureFeedbackTimers() {
   adventureFeedbackTimerIds.forEach((timerId) => clearTimeout(timerId));
@@ -1523,6 +1590,7 @@ function renderAdventureUI() {
 function setAdventureStatus(status) {
   adventureState.status = status;
   renderAdventureUI();
+  reloadForServiceWorkerUpdateIfSafe();
 }
 
 function resetAdventureStateKeepHistory() {
@@ -3688,6 +3756,44 @@ function logSlopeQuestPersistenceDebug(extra) {
   });
 }
 
+// 接近と手動踏破の経路が混ざっていないかを実機で追跡する統合ログ。
+// DEBUG_SLOPE_QUEST=false（本番既定）ではDOM参照を含め一切実行しない。
+function logSlopeQuestStateReview(event, extra) {
+  if (!DEBUG_SLOPE_QUEST) return;
+  const q = adventureState.slopeQuest;
+  const overrides = extra || {};
+  const hasCurrentCellOverride = Object.prototype.hasOwnProperty.call(
+    overrides,
+    "currentCellId",
+  );
+  const currentCellId = hasCurrentCellOverride
+    ? overrides.currentCellId
+    : adventureState.currentCellId;
+  const resultBadge = el("slope-quest-result-badge");
+
+  console.log("[slope-quest-state-review]", {
+    event,
+    adventureActive: adventureState.status === "active",
+    status: q.status,
+    arrivalEligible: q.arrivalEligible,
+    completedThisSession: q.completedThisSession,
+    currentCellId,
+    questCellId: q.cellId,
+    isSameCell: !!currentCellId && currentCellId === q.cellId,
+    completionButtonPressed: false,
+    markArrivalEligibleCalled: false,
+    completeSlopeQuestManuallyCalled: false,
+    triggerSlopeQuestCompletionCalled: false,
+    saveCompletedSlopeSpotCalled: false,
+    removeSlopeQuestMarkerCalled: false,
+    questLayerCleared: false,
+    questMarkerExists: Boolean(questMarker),
+    resultBadgeVisible: !!resultBadge && !resultBadge.hidden,
+    completedSlopeSpotCount: completedSlopeSpots.length,
+    ...overrides,
+  });
+}
+
 // 累計節目の紙吹雪が同時に出た場合は、勾配用の紙吹雪を重ねない（既存のtime-goal側と同じ判定）。
 function shouldSuppressSlopeQuestConfettiForDiscovery() {
   return (
@@ -3744,13 +3850,9 @@ function showSlopeQuestNotification() {
 }
 
 function applySlopeQuestCompletedState() {
-  if (!questMarker) return;
-  const element = questMarker.getElement();
-  if (!element) return;
-  element.classList.remove("is-completing", "is-nearby");
-  element.classList.add("is-completed");
-  element.innerHTML = buildSlopeQuestIconHtml(true);
-  element.setAttribute("aria-label", getSlopeQuestAriaLabel("completed"));
+  const element = questMarker ? questMarker.getElement() : null;
+  if (element) element.classList.remove("is-completing");
+  applySlopeQuestMarkerVisualState("completed");
   logSlopeQuestDebug("marker-completed", { markerCompletedStateApplied: true });
 }
 
@@ -3779,6 +3881,13 @@ function buildSlopeQuestArrivalDebugContext(curLat, curLon) {
 function triggerSlopeQuestCompletion(saveResult) {
   if (slopeQuestCompletionInProgress) return; // 多重呼び出し対策(押下直後にボタンを無効化しているため通常は発生しない)
   slopeQuestCompletionInProgress = true;
+
+  logSlopeQuestStateReview("completion-started", {
+    completionButtonPressed: true,
+    completeSlopeQuestManuallyCalled: true,
+    triggerSlopeQuestCompletionCalled: true,
+    saveCompletedSlopeSpotCalled: true,
+  });
 
   const score = adventureState.slopeQuest.score;
   const gradientLabel = score != null ? `勾配目安${score}%` : "";
@@ -4113,6 +4222,9 @@ function showCompletionSheet(completionData) {
   logSlopeQuestPersistenceDebug({
     resultBadgeShown: !!data.slopeQuestCompleted,
   });
+  logSlopeQuestStateReview("result-rendered", {
+    resultBadgeVisible: !!data.slopeQuestCompleted,
+  });
   lastCompletionMessage = getAdventureEndMessage(data.discoveredCellCount);
   el("completion-message").textContent = lastCompletionMessage;
   const firstBtn = el("completion-sheet").querySelector("button");
@@ -4371,11 +4483,9 @@ function handlePosition(pos) {
       handleCellDiscoveryFeedback(ix, iy, milestoneThreshold);
     }
 
-    // GPS/セル接近判定(同一セル一致)は変更しない。ただし、これは「踏破ボタンを表示してよいか」
-    // だけの判定であり、自動達成はしない。一度成立したら、エリア外に出ても自動でfalseへ戻さない。
-    if (!adventureState.slopeQuest.arrivalEligible && isNearSlopeQuest(key)) {
-      markSlopeQuestArrivalEligible(lat, lon);
-    }
+    // GPS/セル接近判定(同一セル一致)は変更しない。接近経路は資格付与だけを担う関数へ集約し、
+    // 保存・達成演出は踏破ボタンのイベント経路からしか呼ばない。
+    handleSlopeQuestProximity(key, lat, lon);
 
     updateCompletedSlopeSpotsIfNeeded(lat, lon); // 過去に踏破済みの旗（現在地周辺のみ）
     updateFogCells(lat, lon); // 精度の粗い測位では霧の中心もずらさない（GPSノイズでの誤表示を避ける）
@@ -4572,6 +4682,17 @@ window.addEventListener("DOMContentLoaded", () => {
   }
 
   if ("serviceWorker" in navigator) {
+    // 既に旧Service Workerが制御中のページだけ、更新版が制御を引き継いだ時点で一度再読込する。
+    // 初回登録では再読込せず、既存のキャッシュ優先戦略も変更しない。
+    const shouldReloadOnControllerChange = Boolean(
+      navigator.serviceWorker.controller,
+    );
+    if (shouldReloadOnControllerChange) {
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        serviceWorkerRefreshPending = true;
+        reloadForServiceWorkerUpdateIfSafe();
+      });
+    }
     navigator.serviceWorker.register("sw.js").catch(() => {});
   }
 });

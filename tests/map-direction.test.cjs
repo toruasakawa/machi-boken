@@ -338,7 +338,7 @@ test("#hud has its own scoped .hidden rule (this codebase does not define a glob
 
 test("service worker cache version was bumped for this feature", () => {
   const sw = readFileSync(join(__dirname, "..", "sw.js"), "utf8");
-  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v30"'), true);
+  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v31"'), true);
 });
 
 test("map-direction-panel participates in the shared focus-trap", () => {

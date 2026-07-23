@@ -46,6 +46,7 @@ function loadProductionAdventure(fetchImpl) {
       cellIndex,
       cellKey,
       isNearSlopeQuest,
+      handleSlopeQuestProximity,
       markSlopeQuestArrivalEligible,
       completeSlopeQuestManually,
       isSameCompletedSlopeSpot,
@@ -84,8 +85,11 @@ function loadProductionAdventure(fetchImpl) {
   const markerCreations = [];
   const completedSpotMarkerCreations = [];
   const questLayerCalls = { clearLayers: 0 };
+  const storageWrites = [];
+  let vibrationCount = 0;
 
   function makeStubElement() {
+    const attributes = new Map();
     const el = {
       classList: {
         _set: new Set(),
@@ -106,8 +110,9 @@ function loadProductionAdventure(fetchImpl) {
       disabled: false,
       hidden: false,
       appendChild: () => {},
-      setAttribute: () => {},
-      getAttribute: () => null,
+      setAttribute: (name, value) => attributes.set(name, String(value)),
+      getAttribute: (name) => attributes.get(name) ?? null,
+      removeAttribute: (name) => attributes.delete(name),
       querySelector: () => null,
       addEventListener: () => {},
       focus: () => {},
@@ -124,14 +129,18 @@ function loadProductionAdventure(fetchImpl) {
   }
 
   function makeFakeMarker(kind) {
+    const markerElement = makeStubElement();
     const m = {
       _handlers: {},
+      _kind: kind,
+      _latlng: null,
       addTo: () => m,
       on(event, handler) {
         m._handlers[event] = handler;
         return m;
       },
-      getElement: () => null,
+      getElement: () => markerElement,
+      getLatLng: () => m._latlng,
       __fireClick() {
         if (m._handlers.click) m._handlers.click({ latlng: { lat: 0, lng: 0 } });
       },
@@ -146,7 +155,9 @@ function loadProductionAdventure(fetchImpl) {
       const entry = { lat: latlng[0], lng: latlng[1] };
       if (isCompletedSpot) completedSpotMarkerCreations.push(entry);
       else markerCreations.push(entry);
-      return makeFakeMarker(isCompletedSpot ? "completed" : "quest");
+      const marker = makeFakeMarker(isCompletedSpot ? "completed" : "quest");
+      marker._latlng = { lat: latlng[0], lng: latlng[1] };
+      return marker;
     },
   };
 
@@ -188,9 +199,13 @@ function loadProductionAdventure(fetchImpl) {
     fetch: (...args) => fetchImpl(...args),
     localStorage: {
       getItem: () => null,
-      setItem: () => {},
+      setItem: (key, value) => storageWrites.push({ key, value }),
     },
-    navigator: {},
+    navigator: {
+      vibrate: () => {
+        vibrationCount += 1;
+      },
+    },
     performance,
     requestAnimationFrame: () => 1,
     cancelAnimationFrame: () => {},
@@ -207,7 +222,14 @@ function loadProductionAdventure(fetchImpl) {
   const hooks = context.__slopeQuestTestHooks;
   hooks.setQuestLayer(questLayerStub);
   hooks.setCompletedSlopeSpotsLayer(completedSlopeSpotsLayerStub);
-  return { hooks, markerCreations, completedSpotMarkerCreations, questLayerCalls };
+  return {
+    hooks,
+    markerCreations,
+    completedSpotMarkerCreations,
+    questLayerCalls,
+    storageWrites,
+    getVibrationCount: () => vibrationCount,
+  };
 }
 
 function activateAdventure(hooks) {
@@ -413,6 +435,30 @@ test("drawQuestMarker also draws for the nearby status (candidate stays visible 
   assert.equal(markerCreations.length, 1);
 });
 
+test("drawQuestMarker updates an existing flag in place and never clears the quest layer for ready/nearby/completed state changes", () => {
+  const { hooks, markerCreations, questLayerCalls } = loadProductionAdventure(makeSuccessFetch());
+  hooks.adventureState.slopeQuest.status = "ready";
+  hooks.adventureState.slopeQuest.lat = 35.7;
+  hooks.adventureState.slopeQuest.lng = 139.8;
+  hooks.adventureState.slopeQuest.cellId = "1_1";
+
+  hooks.drawQuestMarker();
+  const originalMarker = hooks.getQuestMarker();
+  hooks.adventureState.slopeQuest.status = "nearby";
+  hooks.drawQuestMarker();
+
+  assert.equal(hooks.getQuestMarker(), originalMarker);
+  assert.equal(markerCreations.length, 1);
+  assert.equal(questLayerCalls.clearLayers, 0);
+  assert.equal(originalMarker.getLatLng().lat, 35.7);
+  assert.equal(originalMarker.getLatLng().lng, 139.8);
+  assert.equal(originalMarker.getElement().classList.contains("is-nearby"), true);
+  assert.equal(
+    originalMarker.getElement().getAttribute("aria-label"),
+    "勾配スポットの近くです",
+  );
+});
+
 /* ---------- 接近判定: 「踏破ボタンを表示してよいか」だけを決める。自動達成しない ---------- */
 
 test("isNearSlopeQuest uses the same same-cell rule and is true for ready/nearby, false otherwise", () => {
@@ -426,27 +472,92 @@ test("isNearSlopeQuest uses the same same-cell rule and is true for ready/nearby
   assert.equal(hooks.isNearSlopeQuest("5_5"), false); // completedはこの判定の対象外(既に確定済み)
 });
 
-test("markSlopeQuestArrivalEligible sets arrivalEligible+status=nearby, shows the action panel, but does NOT auto-complete, save, or vibrate/confetti", () => {
-  const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
+test("GPS proximity sets arrivalEligible+status=nearby, keeps the same flag, shows the panel, and does not save/complete/vibrate", () => {
+  const {
+    hooks,
+    markerCreations,
+    questLayerCalls,
+    storageWrites,
+    getVibrationCount,
+  } = loadProductionAdventure(makeSuccessFetch());
   hooks.setOrigin(TOKYO);
+  hooks.adventureState.status = "active";
   hooks.adventureState.slopeQuest.status = "ready";
   hooks.adventureState.slopeQuest.lat = TOKYO.lat0;
   hooks.adventureState.slopeQuest.lng = TOKYO.lon0;
-  hooks.adventureState.slopeQuest.cellId = "1_1";
+  const questCellId = hooks.cellKey(
+    ...Object.values(hooks.cellIndex(TOKYO.lat0, TOKYO.lon0)),
+  );
+  hooks.adventureState.slopeQuest.cellId = questCellId;
   hooks.drawQuestMarker(); // 旗を用意しておく(is-nearbyクラス付与の対象にするため)
+  const originalMarker = hooks.getQuestMarker();
 
-  hooks.markSlopeQuestArrivalEligible(TOKYO.lat0, TOKYO.lon0);
+  const entered = hooks.handleSlopeQuestProximity(
+    questCellId,
+    TOKYO.lat0,
+    TOKYO.lon0,
+  );
 
+  assert.equal(entered, true);
   assert.equal(hooks.adventureState.slopeQuest.arrivalEligible, true);
   assert.equal(hooks.adventureState.slopeQuest.status, "nearby");
   assert.equal(hooks.adventureState.slopeQuest.completedThisSession, false);
   assert.equal(hooks.getCompletedSlopeSpots().length, 0); // 保存されていない
+  assert.equal(storageWrites.length, 0);
+  assert.equal(getVibrationCount(), 0);
   assert.equal(hooks.getElementById("slope-quest-action-panel").hidden, false);
   assert.equal(markerCreations.length, 1); // 再描画されていない(同じ旗のまま)
+  assert.equal(hooks.getQuestMarker(), originalMarker);
+  assert.equal(questLayerCalls.clearLayers, 0);
+  assert.equal(originalMarker.getLatLng().lat, TOKYO.lat0);
+  assert.equal(originalMarker.getLatLng().lng, TOKYO.lon0);
+  assert.equal(originalMarker.getElement().classList.contains("is-nearby"), true);
+  assert.equal(originalMarker.getElement().classList.contains("is-completed"), false);
 
   // 一度trueになったら、再度呼んでも状態は変わらない(冪等)
-  hooks.markSlopeQuestArrivalEligible(TOKYO.lat0 + 1, TOKYO.lon0 + 1);
+  const enteredAgain = hooks.handleSlopeQuestProximity(
+    questCellId,
+    TOKYO.lat0 + 1,
+    TOKYO.lon0 + 1,
+  );
+  assert.equal(enteredAgain, false);
   assert.equal(hooks.adventureState.slopeQuest.status, "nearby");
+});
+
+test("a delayed elevation response is discarded after the quest has already moved to nearby, without clearing or moving the flag", async () => {
+  let resolveFetch;
+  const fetchImpl = (url, options) => {
+    const body = JSON.parse(options.body);
+    return new Promise((resolve) => {
+      resolveFetch = () =>
+        resolve({
+          ok: true,
+          json: async () => ({
+            results: body.locations.map((loc, i) => ({ elevation: i * 10 })),
+          }),
+        });
+    });
+  };
+  const { hooks, markerCreations, questLayerCalls } = loadProductionAdventure(fetchImpl);
+  activateAdventure(hooks);
+
+  const pending = hooks.ensureQuest();
+  hooks.adventureState.slopeQuest.status = "nearby";
+  hooks.adventureState.slopeQuest.lat = 35.7;
+  hooks.adventureState.slopeQuest.lng = 139.8;
+  hooks.adventureState.slopeQuest.cellId = "locked-cell";
+  hooks.adventureState.slopeQuest.arrivalEligible = true;
+  hooks.drawQuestMarker();
+  const lockedMarker = hooks.getQuestMarker();
+
+  resolveFetch();
+  await pending;
+
+  assert.equal(hooks.adventureState.slopeQuest.status, "nearby");
+  assert.equal(hooks.adventureState.slopeQuest.cellId, "locked-cell");
+  assert.equal(hooks.getQuestMarker(), lockedMarker);
+  assert.equal(markerCreations.length, 1);
+  assert.equal(questLayerCalls.clearLayers, 0);
 });
 
 /* ---------- 踏破ボタン: ユーザーが押したときだけ達成が確定する ---------- */
@@ -798,12 +909,11 @@ test("ensureQuest's stale-response guard reports every reason string from the sp
   }
 });
 
-test("the arrival check in handlePosition only sets arrivalEligible/nearby, it does not call triggerSlopeQuestCompletion directly (no auto-completion)", () => {
-  const arrivalBlock = appSource.match(
-    /if \(!adventureState\.slopeQuest\.arrivalEligible[\s\S]*?markSlopeQuestArrivalEligible\(lat, lon\);\s*\n\s*\}/,
-  );
-  assert.ok(arrivalBlock, "arrival-eligible block not found in handlePosition");
-  assert.equal(arrivalBlock[0].includes("triggerSlopeQuestCompletion"), false);
+test("handlePosition delegates to the proximity-only transition and never invokes completion directly", () => {
+  const fn = appSource.match(/function handlePosition\(pos\)[\s\S]*?\n}\n/)[0];
+  assert.equal(fn.includes("handleSlopeQuestProximity(key, lat, lon)"), true);
+  assert.equal(fn.includes("triggerSlopeQuestCompletion"), false);
+  assert.equal(fn.includes("completeSlopeQuestManually"), false);
 });
 
 test("completeSlopeQuestManually is the only call site of triggerSlopeQuestCompletion (completion is button-driven only)", () => {
@@ -819,6 +929,42 @@ test("the removed auto-completion behaviors are gone: no arrival-triggered confe
   assert.equal(appSource.includes("holdCompletedMs"), false);
   assert.equal(appSource.includes("removeFadeMs"), false);
   assert.equal(appSource.includes("function removeSlopeQuestMarker"), false);
+});
+
+test("nearby CSS is visual emphasis only and never hides the flag", () => {
+  const css = readFileSync(join(__dirname, "..", "styles.css"), "utf8");
+  const nearbyBlocks = css.match(/\.slope-quest-marker\.is-nearby[^}]*}/g) || [];
+  assert.ok(nearbyBlocks.length > 0);
+  const nearbyCss = nearbyBlocks.join("\n");
+  assert.equal(/display\s*:\s*none/.test(nearbyCss), false);
+  assert.equal(/visibility\s*:\s*hidden/.test(nearbyCss), false);
+  assert.equal(/opacity\s*:\s*0(?:\.0+)?\s*[;}]/.test(nearbyCss), false);
+  assert.equal(/scale\(0\)/.test(nearbyCss), false);
+});
+
+test("normal quest rendering never clears the flag layer; clearing remains limited to adventure end and new-adventure reset", () => {
+  const clearCalls = appSource.match(/questLayer\.clearLayers\(\)/g) || [];
+  assert.equal(clearCalls.length, 2);
+  const drawFn = appSource.match(/function drawQuestMarker\(\)[\s\S]*?\n}\n/)[0];
+  assert.equal(drawFn.includes("questLayer.clearLayers()"), false);
+});
+
+test("state review diagnostics are gated by DEBUG_SLOPE_QUEST and expose the requested transition fields", () => {
+  const fn = appSource.match(/function logSlopeQuestStateReview\([\s\S]*?\n}\n/)[0];
+  assert.equal(fn.includes("if (!DEBUG_SLOPE_QUEST) return"), true);
+  for (const field of [
+    "completionButtonPressed",
+    "markArrivalEligibleCalled",
+    "completeSlopeQuestManuallyCalled",
+    "triggerSlopeQuestCompletionCalled",
+    "saveCompletedSlopeSpotCalled",
+    "questLayerCleared",
+    "questMarkerExists",
+    "resultBadgeVisible",
+    "completedSlopeSpotCount",
+  ]) {
+    assert.equal(fn.includes(field), true, `missing debug field: ${field}`);
+  }
 });
 
 test("the old am_quest localStorage key is no longer defined as an active STORAGE_KEYS entry, and the free-floating quest variable is gone", () => {
@@ -840,5 +986,12 @@ test("endAdventure hides the action panel and conditionally retires the slope-qu
 
 test("service worker cache version was bumped for this fix", () => {
   const sw = readFileSync(join(__dirname, "..", "sw.js"), "utf8");
-  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v30"'), true);
+  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v31"'), true);
+  assert.equal(appSource.includes('addEventListener("controllerchange"'), true);
+  const reloadFn = appSource.match(
+    /function reloadForServiceWorkerUpdateIfSafe\(\)[\s\S]*?\n}\n/,
+  )[0];
+  assert.equal(reloadFn.includes('adventureState.status !== "idle"'), true);
+  const statusFn = appSource.match(/function setAdventureStatus\([\s\S]*?\n}\n/)[0];
+  assert.equal(statusFn.includes("reloadForServiceWorkerUpdateIfSafe()"), true);
 });

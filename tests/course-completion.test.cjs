@@ -783,7 +783,7 @@ test("reduced-motion stops the ring pulse/pop and shortens notification transiti
 
 test("service worker cache version includes the updated app shell", () => {
   const sw = readFileSync(join(__dirname, "..", "sw.js"), "utf8");
-  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v30"'), true);
+  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v31"'), true);
   for (const asset of ["./index.html", "./styles.css", "./app.js"]) {
     assert.equal(sw.includes(`"${asset}"`), true, `missing ${asset}`);
   }

@@ -110,6 +110,9 @@ const DISTANCE_MAX_ACCURACY_M = 35;
 // ここに無いのは「新しい点として保存するか」という記録間隔だけの追加条件。
 const ROUTE_RECORDING_CONFIG = {
   maxAccuracyM: DISTANCE_MAX_ACCURACY_M,
+  startPointMaxAgeMs: 15000, // 冒険開始操作時点からこの時間以内の測位だけを開始点候補にする
+  endPointMaxAgeMs: 15000, // 終了操作時も、直近に受信した新しい測位だけを終点候補にする
+  endPointMinDistanceM: DISTANCE_MIN_STEP_M, // 終点だけは通常の10m間隔を緩和し、3m以上なら残す
   minDistanceM: 10, // 前回保存点からこれ以上動いたら新しい点を保存する
   maxIntervalMs: 15000, // これ以上経過し、かつ少し位置が変化していれば保存する
   minIntervalDistanceM: 3, // ↑の「少し変化」の下限（GPSノイズだけでの保存を避ける）
@@ -1803,8 +1806,10 @@ function beginAdventureFlow() {
 
 function endAdventure() {
   if (adventureState.status !== "active") return;
-  updateAdventureTime();
-  adventureState.endedAt = Date.now();
+  const endedAt = Date.now();
+  updateAdventureTime(endedAt);
+  appendLatestRouteEndPoint(endedAt);
+  adventureState.endedAt = endedAt;
   adventureState.completionData = getAdventureCompletionData();
   stopAdventureTimer();
   clearAdventureFeedbackTimers();
@@ -2777,29 +2782,54 @@ function confirmDirection() {
       : null;
   adventureState.startCellId = lastReliableCellId;
   adventureState.currentCellId = lastReliableCellId;
-  adventureState.lastDistancePoint = lastReliablePosition
-    ? { ...lastReliablePosition }
+  const startPointReview = {};
+  const trackingStartPosition = getEligibleRouteStartPosition(
+    lastReliablePosition,
+    adventureState.startedAt,
+    startPointReview,
+  );
+  adventureState.lastDistancePoint = trackingStartPosition
+    ? { ...trackingStartPosition }
     : null;
   // ルート記録は冒険開始の瞬間からにする（時間選択中・標識操作中は記録しない）。
-  // 現在の有効GPS位置があれば開始点として1点目に加える（distanceMetersと同じ考え方）。
+  // 開始点も通常点と同じrecordRoutePoint()を通し、精度値を失わないようにする。
   adventureState.routePoints = [];
   adventureState.lastRoutePoint = null;
-  if (lastReliablePosition) {
-    const startRoutePoint = {
-      lat: lastReliablePosition.lat,
-      lon: lastReliablePosition.lon,
-      timestamp: Number.isFinite(lastReliablePosition.timestamp)
-        ? lastReliablePosition.timestamp
-        : Date.now(),
-      accuracy: null,
-      cumulativeDistanceM: 0,
-    };
-    adventureState.routePoints.push(startRoutePoint);
-    adventureState.lastRoutePoint = startRoutePoint;
-  }
   compassState = "collapsed";
   renderCompass();
   setAdventureStatus("active");
+  if (trackingStartPosition) {
+    const routePointReview = {};
+    const acceptedForRoute = recordRoutePoint(
+      trackingStartPosition.lat,
+      trackingStartPosition.lon,
+      trackingStartPosition.timestamp,
+      trackingStartPosition.accuracy,
+      {
+        pointRole: "start",
+        receivedAt: trackingStartPosition.receivedAt,
+        evaluatedAt: adventureState.startedAt,
+        maxAgeMs: ROUTE_RECORDING_CONFIG.startPointMaxAgeMs,
+        review: routePointReview,
+      },
+    );
+    logRouteAccuracyReview(
+      acceptedForRoute ? "start-point-added" : "start-point-skipped",
+      {
+        ...routePointReview,
+        acceptedForDistance: true,
+        acceptedForRoute,
+        isStartPoint: true,
+      },
+    );
+  } else {
+    logRouteAccuracyReview("start-point-skipped", {
+      ...startPointReview,
+      acceptedForDistance: false,
+      acceptedForRoute: false,
+      isStartPoint: true,
+    });
+  }
   renderAdventureHud();
   startAdventureTimer();
   showToast(`${adventureState.direction.label}へ冒険開始！`);
@@ -3268,108 +3298,258 @@ function registerAdventureVisitedCell(ix, iy) {
   return true;
 }
 
-function registerAdventureDistance(lat, lon, timestamp, accuracy) {
-  if (adventureState.status !== "active") return false;
-  if (Number.isFinite(accuracy) && accuracy > DISTANCE_MAX_ACCURACY_M) {
+function copyGpsQualityReview(target, evaluation) {
+  if (target && typeof target === "object") {
+    Object.assign(target, evaluation);
+  }
+}
+
+// 開始点・通常点・終了点で同じ品質判定を使う。表示や保存用の座標はログへ渡さない。
+function evaluateGpsPointQuality(currentPoint, previousPoint, options) {
+  const evaluationOptions = options || {};
+  const evaluation = {
+    accepted: false,
+    rejectionReason: null,
+    ageMs: null,
+    segmentDistanceM: null,
+    elapsedSeconds: null,
+    calculatedSpeedMps: null,
+    accuracyM: currentPoint ? currentPoint.accuracy : null,
+    timestamp: currentPoint ? currentPoint.timestamp : null,
+    receivedAt: currentPoint ? currentPoint.receivedAt : null,
+  };
+  const reject = (reason) => {
+    evaluation.rejectionReason = reason;
+    return evaluation;
+  };
+
+  if (
+    !currentPoint ||
+    !Number.isFinite(currentPoint.lat) ||
+    !Number.isFinite(currentPoint.lon)
+  ) {
+    return reject("invalid-coordinates");
+  }
+  const maxAccuracyM = Number.isFinite(evaluationOptions.maxAccuracyM)
+    ? evaluationOptions.maxAccuracyM
+    : ROUTE_RECORDING_CONFIG.maxAccuracyM;
+  if (
+    !Number.isFinite(currentPoint.accuracy) &&
+    evaluationOptions.requireFiniteAccuracy !== false
+  ) {
+    return reject("invalid-accuracy");
+  }
+  if (
+    Number.isFinite(currentPoint.accuracy) &&
+    currentPoint.accuracy > maxAccuracyM
+  ) {
+    return reject("low-accuracy");
+  }
+  if (!Number.isFinite(currentPoint.timestamp)) {
+    return reject("invalid-timestamp");
+  }
+
+  if (Number.isFinite(evaluationOptions.maxAgeMs)) {
+    if (
+      !Number.isFinite(evaluationOptions.evaluatedAt) ||
+      !Number.isFinite(currentPoint.receivedAt)
+    ) {
+      return reject("invalid-received-at");
+    }
+    const timestampAgeMs =
+      evaluationOptions.evaluatedAt - currentPoint.timestamp;
+    const receivedAgeMs =
+      evaluationOptions.evaluatedAt - currentPoint.receivedAt;
+    evaluation.ageMs = Math.max(timestampAgeMs, receivedAgeMs);
+    if (
+      timestampAgeMs < 0 ||
+      receivedAgeMs < 0 ||
+      timestampAgeMs > evaluationOptions.maxAgeMs ||
+      receivedAgeMs > evaluationOptions.maxAgeMs
+    ) {
+      return reject("stale-position");
+    }
+  }
+
+  if (previousPoint) {
+    if (
+      !Number.isFinite(previousPoint.timestamp) ||
+      currentPoint.timestamp <= previousPoint.timestamp
+    ) {
+      return reject("non-monotonic-timestamp");
+    }
+    evaluation.segmentDistanceM = haversineMeters(
+      previousPoint.lat,
+      previousPoint.lon,
+      currentPoint.lat,
+      currentPoint.lon,
+    );
+    if (!Number.isFinite(evaluation.segmentDistanceM)) {
+      return reject("invalid-segment-distance");
+    }
+    evaluation.elapsedSeconds =
+      (currentPoint.timestamp - previousPoint.timestamp) / 1000;
+    evaluation.calculatedSpeedMps =
+      evaluation.segmentDistanceM / evaluation.elapsedSeconds;
+
+    const maxSegmentDistanceM = Number.isFinite(
+      evaluationOptions.maxSegmentDistanceM,
+    )
+      ? evaluationOptions.maxSegmentDistanceM
+      : ROUTE_RECORDING_CONFIG.maxSegmentDistanceM;
+    if (evaluation.segmentDistanceM > maxSegmentDistanceM) {
+      return reject("gps-jump");
+    }
+    const maxSpeedMps = Number.isFinite(evaluationOptions.maxSpeedMps)
+      ? evaluationOptions.maxSpeedMps
+      : ROUTE_RECORDING_CONFIG.maxSpeedMps;
+    if (evaluation.calculatedSpeedMps > maxSpeedMps) {
+      return reject("excessive-speed");
+    }
+    if (
+      Number.isFinite(evaluationOptions.minDistanceM) &&
+      evaluation.segmentDistanceM < evaluationOptions.minDistanceM
+    ) {
+      return reject("below-min-distance");
+    }
+  }
+
+  evaluation.accepted = true;
+  return evaluation;
+}
+
+function registerAdventureDistance(lat, lon, timestamp, accuracy, options) {
+  const registerOptions = options || {};
+  if (adventureState.status !== "active") {
+    copyGpsQualityReview(registerOptions.review, {
+      accepted: false,
+      rejectionReason: "inactive-adventure",
+    });
     return false;
   }
   const currentPoint = {
     lat,
     lon,
-    timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
+    timestamp,
+    accuracy,
+    receivedAt: registerOptions.receivedAt,
   };
   const previousPoint = adventureState.lastDistancePoint;
-  if (!previousPoint) {
-    adventureState.lastDistancePoint = currentPoint;
-    return false;
-  }
+  const evaluation = evaluateGpsPointQuality(currentPoint, previousPoint, {
+    maxAccuracyM: DISTANCE_MAX_ACCURACY_M,
+    // 距離計測が従来許容していたaccuracy未提供点の扱いは変えない。
+    requireFiniteAccuracy: false,
+    minDistanceM: DISTANCE_MIN_STEP_M,
+    maxSegmentDistanceM: DISTANCE_MAX_STEP_M,
+    maxSpeedMps: DISTANCE_MAX_SPEED_MPS,
+  });
 
-  const stepMeters = haversineMeters(
-    previousPoint.lat,
-    previousPoint.lon,
-    currentPoint.lat,
-    currentPoint.lon,
-  );
-  const elapsedSeconds = Math.max(
-    0,
-    (currentPoint.timestamp - previousPoint.timestamp) / 1000,
-  );
-  const speedMps = elapsedSeconds > 0 ? stepMeters / elapsedSeconds : Infinity;
-  const isValidStep =
-    Number.isFinite(stepMeters) &&
-    stepMeters >= DISTANCE_MIN_STEP_M &&
-    stepMeters <= DISTANCE_MAX_STEP_M &&
-    speedMps <= DISTANCE_MAX_SPEED_MPS;
-
-  if (!isValidStep) {
+  if (!evaluation.accepted) {
     // 外れ値そのものは加算しないが、次の正常点で復帰できるよう基準点だけ更新する。
     if (
-      stepMeters > DISTANCE_MAX_STEP_M ||
-      (elapsedSeconds > 0 && speedMps > DISTANCE_MAX_SPEED_MPS)
+      evaluation.rejectionReason === "gps-jump" ||
+      evaluation.rejectionReason === "excessive-speed"
     ) {
       adventureState.lastDistancePoint = currentPoint;
     }
+    copyGpsQualityReview(registerOptions.review, evaluation);
     return false;
   }
-  adventureState.distanceMeters += stepMeters;
+  if (!previousPoint) {
+    adventureState.lastDistancePoint = currentPoint;
+    copyGpsQualityReview(registerOptions.review, {
+      ...evaluation,
+      accepted: false,
+      rejectionReason: "distance-baseline-only",
+    });
+    return false;
+  }
+
+  adventureState.distanceMeters += evaluation.segmentDistanceM;
   adventureState.lastDistancePoint = currentPoint;
+  copyGpsQualityReview(registerOptions.review, evaluation);
   return true;
+}
+
+function getEligibleRouteStartPosition(position, startTimestamp, review) {
+  const evaluation = evaluateGpsPointQuality(position, null, {
+    evaluatedAt: startTimestamp,
+    maxAgeMs: ROUTE_RECORDING_CONFIG.startPointMaxAgeMs,
+    maxAccuracyM: ROUTE_RECORDING_CONFIG.maxAccuracyM,
+  });
+  copyGpsQualityReview(review, evaluation);
+  if (!evaluation.accepted) return null;
+  return {
+    lat: position.lat,
+    lon: position.lon,
+    timestamp: position.timestamp,
+    accuracy: position.accuracy,
+    receivedAt: position.receivedAt,
+  };
 }
 
 // 冒険中のGPS点のうち、終了画面の「今日歩いた形」用に残す点だけを間引いて保存する。
 // 精度・速度・ジャンプの判定基準はregisterAdventureDistance()と揃えているが、
 // 「保存するかどうか」はこちらだけの記録間隔(ROUTE_RECORDING_CONFIG)で決める。
-function recordRoutePoint(lat, lon, timestamp, accuracy) {
-  if (adventureState.status !== "active") return false;
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
-  if (
-    Number.isFinite(accuracy) &&
-    accuracy > ROUTE_RECORDING_CONFIG.maxAccuracyM
-  ) {
+function recordRoutePoint(lat, lon, timestamp, accuracy, options) {
+  const recordOptions = options || {};
+  if (adventureState.status !== "active") {
+    copyGpsQualityReview(recordOptions.review, {
+      accepted: false,
+      rejectionReason: "inactive-adventure",
+    });
     return false;
   }
-  const ts = Number.isFinite(timestamp) ? timestamp : Date.now();
-  const safeAccuracy = Number.isFinite(accuracy) ? accuracy : null;
-
   const previous = adventureState.lastRoutePoint;
-  if (!previous) {
-    const point = { lat, lon, timestamp: ts, accuracy: safeAccuracy, cumulativeDistanceM: 0 };
-    adventureState.routePoints.push(point);
-    adventureState.lastRoutePoint = point;
-    return true;
-  }
-
-  const stepMeters = haversineMeters(previous.lat, previous.lon, lat, lon);
-  if (!Number.isFinite(stepMeters)) return false;
-
-  const elapsedSeconds = Math.max(0, (ts - previous.timestamp) / 1000);
-  const speedMps = elapsedSeconds > 0 ? stepMeters / elapsedSeconds : Infinity;
-  const isJump =
-    stepMeters > ROUTE_RECORDING_CONFIG.maxSegmentDistanceM ||
-    (elapsedSeconds > 0 && speedMps > ROUTE_RECORDING_CONFIG.maxSpeedMps);
-
-  if (isJump) {
-    // registerAdventureDistance()と違い、基準点は進めない。
-    // ここで基準点をジャンプ先へ進めてしまうと、GPSが元の場所へ自己修正した後の
-    // 正常な一歩が「ジャンプ先からの小さな移動」として採用されてしまい、形状全体の
-    // 縮尺がジャンプ先まで含めて引き伸ばされる（線が極端に縮んで見える）。
-    // 基準点を据え置くことで、GPSが元の位置付近へ戻った時点で自然に復帰できる。
+  const pointRole = recordOptions.pointRole || "normal";
+  const currentPoint = {
+    lat,
+    lon,
+    timestamp,
+    accuracy,
+    receivedAt: recordOptions.receivedAt,
+  };
+  const evaluation = evaluateGpsPointQuality(currentPoint, previous, {
+    evaluatedAt: recordOptions.evaluatedAt,
+    maxAgeMs: recordOptions.maxAgeMs,
+    maxAccuracyM: ROUTE_RECORDING_CONFIG.maxAccuracyM,
+    minDistanceM:
+      pointRole === "end"
+        ? ROUTE_RECORDING_CONFIG.endPointMinDistanceM
+        : 0,
+    maxSegmentDistanceM: ROUTE_RECORDING_CONFIG.maxSegmentDistanceM,
+    maxSpeedMps: ROUTE_RECORDING_CONFIG.maxSpeedMps,
+  });
+  if (!evaluation.accepted) {
+    copyGpsQualityReview(recordOptions.review, evaluation);
     return false;
   }
 
-  const elapsedSincePreviousMs = ts - previous.timestamp;
-  const shouldRecord =
-    stepMeters >= ROUTE_RECORDING_CONFIG.minDistanceM ||
-    (elapsedSincePreviousMs >= ROUTE_RECORDING_CONFIG.maxIntervalMs &&
-      stepMeters >= ROUTE_RECORDING_CONFIG.minIntervalDistanceM);
-  if (!shouldRecord) return false;
+  if (previous && pointRole !== "end") {
+    const elapsedSincePreviousMs = timestamp - previous.timestamp;
+    const shouldRecord =
+      evaluation.segmentDistanceM >= ROUTE_RECORDING_CONFIG.minDistanceM ||
+      (elapsedSincePreviousMs >= ROUTE_RECORDING_CONFIG.maxIntervalMs &&
+        evaluation.segmentDistanceM >=
+          ROUTE_RECORDING_CONFIG.minIntervalDistanceM);
+    if (!shouldRecord) {
+      copyGpsQualityReview(recordOptions.review, {
+        ...evaluation,
+        accepted: false,
+        rejectionReason: "route-spacing",
+      });
+      return false;
+    }
+  }
 
   const point = {
     lat,
     lon,
-    timestamp: ts,
-    accuracy: safeAccuracy,
-    cumulativeDistanceM: previous.cumulativeDistanceM + stepMeters,
+    timestamp,
+    accuracy,
+    cumulativeDistanceM: previous
+      ? previous.cumulativeDistanceM + evaluation.segmentDistanceM
+      : 0,
   };
   adventureState.routePoints.push(point);
   adventureState.lastRoutePoint = point;
@@ -3377,7 +3557,74 @@ function recordRoutePoint(lat, lon, timestamp, accuracy) {
   if (adventureState.routePoints.length > ROUTE_RECORDING_CONFIG.maxPoints) {
     thinRoutePoints();
   }
+  copyGpsQualityReview(recordOptions.review, evaluation);
   return true;
+}
+
+function logRouteAccuracyReview(event, details) {
+  if (!DEBUG_ROUTE_SHAPE) return;
+  const review = details || {};
+  console.log("[route-accuracy-review]", {
+    event,
+    accuracyM: Number.isFinite(review.accuracyM) ? review.accuracyM : null,
+    timestamp: Number.isFinite(review.timestamp) ? review.timestamp : null,
+    receivedAt: Number.isFinite(review.receivedAt) ? review.receivedAt : null,
+    ageMs: Number.isFinite(review.ageMs) ? review.ageMs : null,
+    acceptedForDistance: review.acceptedForDistance === true,
+    acceptedForRoute: review.acceptedForRoute === true,
+    rejectionReason: review.rejectionReason || null,
+    segmentDistanceM: Number.isFinite(review.segmentDistanceM)
+      ? review.segmentDistanceM
+      : null,
+    elapsedSeconds: Number.isFinite(review.elapsedSeconds)
+      ? review.elapsedSeconds
+      : null,
+    calculatedSpeedMps: Number.isFinite(review.calculatedSpeedMps)
+      ? review.calculatedSpeedMps
+      : null,
+    routePointCount: adventureState.routePoints.length,
+    isStartPoint: review.isStartPoint === true,
+    isEndPoint: review.isEndPoint === true,
+    lastRouteTimestamp: Number.isFinite(adventureState.lastRoutePoint?.timestamp)
+      ? adventureState.lastRoutePoint.timestamp
+      : null,
+  });
+}
+
+function appendLatestRouteEndPoint(evaluatedAt) {
+  const review = {};
+  if (!lastReliablePosition) {
+    logRouteAccuracyReview("end-point-skipped", {
+      acceptedForDistance: false,
+      acceptedForRoute: false,
+      rejectionReason: "missing-position",
+      isEndPoint: true,
+    });
+    return false;
+  }
+  const acceptedForRoute = recordRoutePoint(
+    lastReliablePosition.lat,
+    lastReliablePosition.lon,
+    lastReliablePosition.timestamp,
+    lastReliablePosition.accuracy,
+    {
+      pointRole: "end",
+      receivedAt: lastReliablePosition.receivedAt,
+      evaluatedAt,
+      maxAgeMs: ROUTE_RECORDING_CONFIG.endPointMaxAgeMs,
+      review,
+    },
+  );
+  logRouteAccuracyReview(
+    acceptedForRoute ? "end-point-added" : "end-point-skipped",
+    {
+      ...review,
+      acceptedForDistance: false,
+      acceptedForRoute,
+      isEndPoint: true,
+    },
+  );
+  return acceptedForRoute;
 }
 
 // 点数が上限を超えたら、開始点(先頭)を残しつつ2点に1点へ間引く。記録自体は止めない。
@@ -4576,6 +4823,7 @@ let lastReliableCellId = null;
 
 function handlePosition(pos) {
   const { latitude: lat, longitude: lon, accuracy } = pos.coords;
+  const positionReceivedAt = Date.now();
 
   if (!origin) {
     origin = { lat0: lat, lon0: lon };
@@ -4619,15 +4867,47 @@ function handlePosition(pos) {
     const key = cellKey(ix, iy);
     const positionTimestamp = Number.isFinite(pos.timestamp)
       ? pos.timestamp
-      : Date.now();
-    lastReliablePosition = { lat, lon, timestamp: positionTimestamp };
+      : positionReceivedAt;
+    lastReliablePosition = {
+      lat,
+      lon,
+      timestamp: positionTimestamp,
+      accuracy: Number.isFinite(accuracy) ? accuracy : null,
+      receivedAt: positionReceivedAt,
+    };
     lastReliableCellId = key;
     adventureState.currentCellId = key;
 
     if (adventureState.status === "active") {
-      registerAdventureDistance(lat, lon, positionTimestamp, accuracy);
+      const distanceReview = {};
+      const routeReview = {};
+      const acceptedForDistance = registerAdventureDistance(
+        lat,
+        lon,
+        positionTimestamp,
+        accuracy,
+        { receivedAt: positionReceivedAt, review: distanceReview },
+      );
       registerAdventureVisitedCell(ix, iy);
-      recordRoutePoint(lat, lon, positionTimestamp, accuracy);
+      const acceptedForRoute = recordRoutePoint(
+        lat,
+        lon,
+        positionTimestamp,
+        accuracy,
+        { receivedAt: positionReceivedAt, review: routeReview },
+      );
+      logRouteAccuracyReview("gps-position", {
+        ...routeReview,
+        acceptedForDistance,
+        acceptedForRoute,
+        rejectionReason: !acceptedForRoute
+          ? routeReview.rejectionReason
+          : !acceptedForDistance
+            ? distanceReview.rejectionReason
+            : null,
+        isStartPoint: false,
+        isEndPoint: false,
+      });
     }
 
     if (!visited[key]) {

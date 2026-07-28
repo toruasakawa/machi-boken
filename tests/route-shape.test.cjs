@@ -11,7 +11,11 @@ function loadProductionRouteShape() {
   const source = readFileSync(appPath, "utf8");
   const exposeTestHooks = `
     globalThis.__routeShapeTestHooks = {
+      registerAdventureDistance,
       recordRoutePoint,
+      getEligibleRouteStartPosition,
+      evaluateGpsPointQuality,
+      appendLatestRouteEndPoint,
       getRouteShapeRenderData,
       projectRoutePoints,
       rotateRoutePoints,
@@ -23,10 +27,31 @@ function loadProductionRouteShape() {
       setOrigin(o) { origin = o; },
       beginActiveAdventure() {
         adventureState.status = "active";
+        adventureState.distanceMeters = 0;
+        adventureState.lastDistancePoint = null;
         adventureState.routePoints = [];
         adventureState.lastRoutePoint = null;
       },
       setStatus(s) { adventureState.status = s; },
+      setLastDistancePoint(point) {
+        adventureState.lastDistancePoint = point ? { ...point } : null;
+      },
+      getDistanceState() {
+        return {
+          distanceMeters: adventureState.distanceMeters,
+          lastDistancePoint: adventureState.lastDistancePoint
+            ? { ...adventureState.lastDistancePoint }
+            : null,
+        };
+      },
+      setLastReliablePosition(point) {
+        lastReliablePosition = point ? { ...point } : null;
+      },
+      getLastRoutePoint() {
+        return adventureState.lastRoutePoint
+          ? { ...adventureState.lastRoutePoint }
+          : null;
+      },
       getRoutePoints() { return adventureState.routePoints.map((p) => ({ ...p })); },
       getRoutePointCount() { return adventureState.routePoints.length; },
     };
@@ -68,6 +93,18 @@ const TOKYO = { lat0: 35.681236, lon0: 139.767125 };
 
 /* ---------- recordRoutePoint(): 記録条件 ---------- */
 
+test("route thresholds remain 35m accuracy, 10m/15s spacing, 500m jump, and 4.5m/s speed", () => {
+  assert.equal(route.routeConfig.maxAccuracyM, 35);
+  assert.equal(route.routeConfig.minDistanceM, 10);
+  assert.equal(route.routeConfig.maxIntervalMs, 15000);
+  assert.equal(route.routeConfig.minIntervalDistanceM, 3);
+  assert.equal(route.routeConfig.maxSegmentDistanceM, 500);
+  assert.equal(route.routeConfig.maxSpeedMps, 4.5);
+  assert.equal(route.routeConfig.endPointMinDistanceM, 3);
+  assert.equal(route.routeConfig.startPointMaxAgeMs, 15000);
+  assert.equal(route.routeConfig.endPointMaxAgeMs, 15000);
+});
+
 test("recordRoutePoint: does nothing while the adventure is not active", () => {
   route.setStatus("idle");
   route.setOrigin(TOKYO);
@@ -91,6 +128,102 @@ test("recordRoutePoint: rejects points with accuracy worse than maxAccuracyM", (
   const recorded = route.recordRoutePoint(35.6813, 139.7672, 2000, route.routeConfig.maxAccuracyM + 1);
   assert.equal(recorded, false);
   assert.equal(route.getRoutePointCount(), 1);
+});
+
+test("recordRoutePoint: rejects a point whose accuracy is not finite", () => {
+  route.beginActiveAdventure();
+  assert.equal(
+    route.recordRoutePoint(35.6812, 139.7671, 1000, null),
+    false,
+  );
+  assert.equal(
+    route.recordRoutePoint(35.6812, 139.7671, 1000, Infinity),
+    false,
+  );
+  assert.equal(route.getRoutePointCount(), 0);
+});
+
+test("route start candidate requires finite <=35m accuracy, finite timestamp, and age within 15 seconds", () => {
+  const startedAt = 100000;
+  const valid = {
+    lat: 35.6812,
+    lon: 139.7671,
+    timestamp: startedAt - route.routeConfig.startPointMaxAgeMs,
+    accuracy: route.routeConfig.maxAccuracyM,
+    receivedAt: startedAt - route.routeConfig.startPointMaxAgeMs,
+  };
+
+  const accepted = route.getEligibleRouteStartPosition(valid, startedAt);
+  assert.ok(accepted);
+  assert.equal(accepted.accuracy, route.routeConfig.maxAccuracyM);
+  assert.equal(accepted.timestamp, valid.timestamp);
+  assert.equal(route.routeConfig.startPointMaxAgeMs, 15000);
+  route.beginActiveAdventure();
+  assert.equal(
+    route.recordRoutePoint(
+      accepted.lat,
+      accepted.lon,
+      accepted.timestamp,
+      accepted.accuracy,
+    ),
+    true,
+  );
+  assert.equal(
+    route.getRoutePoints()[0].accuracy,
+    route.routeConfig.maxAccuracyM,
+  );
+
+  for (const invalid of [
+    { ...valid, accuracy: route.routeConfig.maxAccuracyM + 0.1 },
+    { ...valid, accuracy: NaN },
+    { ...valid, timestamp: NaN },
+    { ...valid, receivedAt: NaN },
+    {
+      ...valid,
+      timestamp: startedAt - route.routeConfig.startPointMaxAgeMs - 1,
+    },
+    {
+      ...valid,
+      receivedAt: startedAt - route.routeConfig.startPointMaxAgeMs - 1,
+    },
+    { ...valid, timestamp: startedAt + 1 },
+    { ...valid, receivedAt: startedAt + 1 },
+  ]) {
+    assert.equal(
+      route.getEligibleRouteStartPosition(invalid, startedAt),
+      null,
+    );
+  }
+});
+
+test("confirmDirection seeds the route through recordRoutePoint without replacing accuracy with null", () => {
+  const appSource = readFileSync(join(__dirname, "..", "app.js"), "utf8");
+  const confirmDirection = appSource.match(
+    /function confirmDirection\(\)[\s\S]*?\n}/,
+  );
+  assert.ok(confirmDirection);
+  assert.equal(
+    confirmDirection[0].includes("getEligibleRouteStartPosition"),
+    true,
+  );
+  assert.equal(confirmDirection[0].includes("recordRoutePoint("), true);
+  assert.equal(confirmDirection[0].includes("routePoints.push"), false);
+  assert.equal(confirmDirection[0].includes("accuracy: null"), false);
+});
+
+test("handlePosition retains timestamp, accuracy, and browser receipt time on lastReliablePosition", () => {
+  const appSource = readFileSync(join(__dirname, "..", "app.js"), "utf8");
+  const handlePosition = appSource.match(
+    /function handlePosition\(pos\)[\s\S]*?\n}/,
+  );
+  assert.ok(handlePosition);
+  const assignment = handlePosition[0].match(
+    /lastReliablePosition = \{[\s\S]*?\n    };/,
+  );
+  assert.ok(assignment);
+  assert.equal(assignment[0].includes("timestamp: positionTimestamp"), true);
+  assert.equal(assignment[0].includes("accuracy:"), true);
+  assert.equal(assignment[0].includes("receivedAt: positionReceivedAt"), true);
 });
 
 test("recordRoutePoint: rejects NaN coordinates", () => {
@@ -175,6 +308,223 @@ test("recordRoutePoint: rejects movement faster than maxSpeedMps", () => {
   const recorded = route.recordRoutePoint(35.6822, 139.7671, 1000, 10);
   assert.equal(recorded, false);
   assert.equal(route.getRoutePointCount(), 1);
+});
+
+test("recordRoutePoint: rejects identical and reversed timestamps without moving the route baseline", () => {
+  route.beginActiveAdventure();
+  route.recordRoutePoint(35.6812, 139.7671, 2000, 10);
+
+  assert.equal(
+    route.recordRoutePoint(35.6813, 139.7671, 2000, 10),
+    false,
+  );
+  assert.equal(
+    route.recordRoutePoint(35.6813, 139.7671, 1000, 10),
+    false,
+  );
+  assert.equal(route.getRoutePointCount(), 1);
+  assert.equal(route.getLastRoutePoint().timestamp, 2000);
+});
+
+test("distance recording rejects identical and reversed timestamps without moving its baseline", () => {
+  route.beginActiveAdventure();
+  route.setLastDistancePoint({
+    lat: 35.6812,
+    lon: 139.7671,
+    timestamp: 2000,
+  });
+
+  assert.equal(
+    route.registerAdventureDistance(35.6813, 139.7671, 2000, 10),
+    false,
+  );
+  assert.equal(
+    route.registerAdventureDistance(35.6813, 139.7671, 1000, 10),
+    false,
+  );
+  const state = route.getDistanceState();
+  assert.equal(state.distanceMeters, 0);
+  assert.equal(state.lastDistancePoint.timestamp, 2000);
+});
+
+test("route and distance quality evaluation use the same non-monotonic timestamp rejection", () => {
+  const previous = {
+    lat: 35.6812,
+    lon: 139.7671,
+    timestamp: 2000,
+    accuracy: 10,
+  };
+  for (const timestamp of [2000, 1000]) {
+    const evaluation = route.evaluateGpsPointQuality(
+      {
+        lat: 35.6813,
+        lon: 139.7671,
+        timestamp,
+        accuracy: 10,
+      },
+      previous,
+      {
+        maxAccuracyM: route.routeConfig.maxAccuracyM,
+        minDistanceM: 0,
+        maxSegmentDistanceM: route.routeConfig.maxSegmentDistanceM,
+        maxSpeedMps: route.routeConfig.maxSpeedMps,
+      },
+    );
+    assert.equal(evaluation.accepted, false);
+    assert.equal(evaluation.rejectionReason, "non-monotonic-timestamp");
+  }
+});
+
+test("end point: a fresh valid 3m+ point is appended even when the normal 10m spacing would skip it", () => {
+  const now = 100000;
+  route.beginActiveAdventure();
+  assert.equal(route.recordRoutePoint(35.6812, 139.7671, now - 3000, 10), true);
+  route.setLastReliablePosition({
+    lat: 35.68125,
+    lon: 139.7671,
+    timestamp: now - 1000,
+    accuracy: 10,
+    receivedAt: now - 500,
+  });
+
+  assert.equal(route.appendLatestRouteEndPoint(now), true);
+  assert.equal(route.getRoutePointCount(), 2);
+  assert.equal(route.getLastRoutePoint().timestamp, now - 1000);
+});
+
+test("end point: accuracy worse than 35m is rejected", () => {
+  const now = 100000;
+  route.beginActiveAdventure();
+  route.recordRoutePoint(35.6812, 139.7671, now - 3000, 10);
+  route.setLastReliablePosition({
+    lat: 35.68125,
+    lon: 139.7671,
+    timestamp: now - 1000,
+    accuracy: route.routeConfig.maxAccuracyM + 1,
+    receivedAt: now - 500,
+  });
+
+  assert.equal(route.appendLatestRouteEndPoint(now), false);
+  assert.equal(route.getRoutePointCount(), 1);
+});
+
+test("end point: stale, identical, and reversed timestamps are rejected", () => {
+  const now = 100000;
+  const candidates = [
+    {
+      timestamp: now - route.routeConfig.endPointMaxAgeMs - 1,
+      receivedAt: now - route.routeConfig.endPointMaxAgeMs - 1,
+    },
+    { timestamp: now - 3000, receivedAt: now - 500 },
+    { timestamp: now - 4000, receivedAt: now - 500 },
+  ];
+
+  for (const candidate of candidates) {
+    route.beginActiveAdventure();
+    route.recordRoutePoint(35.6812, 139.7671, now - 3000, 10);
+    route.setLastReliablePosition({
+      lat: 35.68125,
+      lon: 139.7671,
+      accuracy: 10,
+      ...candidate,
+    });
+    assert.equal(route.appendLatestRouteEndPoint(now), false);
+    assert.equal(route.getRoutePointCount(), 1);
+  }
+});
+
+test("end point: movement below 3m and excessive speed are rejected", () => {
+  const now = 100000;
+  const candidates = [
+    {
+      lat: 35.68121,
+      timestamp: now - 1000,
+      receivedAt: now - 500,
+    },
+    {
+      lat: 35.6822,
+      timestamp: now - 2900,
+      receivedAt: now - 500,
+    },
+  ];
+
+  for (const candidate of candidates) {
+    route.beginActiveAdventure();
+    route.recordRoutePoint(35.6812, 139.7671, now - 3000, 10);
+    route.setLastReliablePosition({
+      lon: 139.7671,
+      accuracy: 10,
+      ...candidate,
+    });
+    assert.equal(route.appendLatestRouteEndPoint(now), false);
+    assert.equal(route.getRoutePointCount(), 1);
+  }
+});
+
+test("end point: a segment over 500m is rejected even when its calculated speed is within the limit", () => {
+  const now = 300000;
+  route.beginActiveAdventure();
+  route.recordRoutePoint(35.6812, 139.7671, now - 201000, 10);
+  route.setLastReliablePosition({
+    lat: 35.6867,
+    lon: 139.7671,
+    timestamp: now - 1000,
+    accuracy: 10,
+    receivedAt: now - 500,
+  });
+
+  assert.equal(route.appendLatestRouteEndPoint(now), false);
+  assert.equal(route.getRoutePointCount(), 1);
+});
+
+test("end point: no held reliable position is handled without adding a point", () => {
+  route.beginActiveAdventure();
+  route.setLastReliablePosition(null);
+  assert.equal(route.appendLatestRouteEndPoint(100000), false);
+  assert.equal(route.getRoutePointCount(), 0);
+});
+
+test("endAdventure appends the evaluated endpoint before completion data is created", () => {
+  const appSource = readFileSync(join(__dirname, "..", "app.js"), "utf8");
+  const endAdventure = appSource.match(
+    /function endAdventure\(\)[\s\S]*?\n}/,
+  );
+  assert.ok(endAdventure);
+  const appendIndex = endAdventure[0].indexOf("appendLatestRouteEndPoint");
+  const completionIndex = endAdventure[0].indexOf(
+    "adventureState.completionData = getAdventureCompletionData()",
+  );
+  assert.ok(appendIndex >= 0);
+  assert.ok(completionIndex > appendIndex);
+});
+
+test("route accuracy debug log contains the required fields and no coordinates", () => {
+  const appSource = readFileSync(join(__dirname, "..", "app.js"), "utf8");
+  const logger = appSource.match(
+    /function logRouteAccuracyReview\(event, details\)[\s\S]*?\n}/,
+  );
+  assert.ok(logger);
+  for (const field of [
+    "event",
+    "accuracyM",
+    "timestamp",
+    "receivedAt",
+    "ageMs",
+    "acceptedForDistance",
+    "acceptedForRoute",
+    "rejectionReason",
+    "segmentDistanceM",
+    "elapsedSeconds",
+    "calculatedSpeedMps",
+    "routePointCount",
+    "isStartPoint",
+    "isEndPoint",
+    "lastRouteTimestamp",
+  ]) {
+    assert.equal(logger[0].includes(field), true, `missing debug field: ${field}`);
+  }
+  assert.equal(logger[0].includes("latitude"), false);
+  assert.equal(logger[0].includes("longitude"), false);
 });
 
 test("recordRoutePoint: cumulativeDistanceM accumulates only across accepted steps", () => {

@@ -1247,7 +1247,7 @@ test("endAdventure hides the action panel and conditionally retires the slope-qu
 
 test("service worker cache version was bumped for this fix", () => {
   const sw = readFileSync(join(__dirname, "..", "sw.js"), "utf8");
-  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v33"'), true);
+  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v34"'), true);
   assert.equal(appSource.includes('addEventListener("controllerchange"'), true);
   const reloadFn = appSource.match(
     /function reloadForServiceWorkerUpdateIfSafe\(\)[\s\S]*?\n}\n/,

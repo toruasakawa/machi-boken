@@ -46,17 +46,17 @@
   <button id="btn-end-adventure" class="adventure-end-btn" type="button">冒険を終える</button>
 </div>
 
-<!-- 勾配スポット踏破ボタン。GPS/セル接近判定は「表示してよいか」だけに使い、
+<!-- 坂道スポット踏破ボタン。GPS/セル接近判定は「表示してよいか」だけに使い、
      自動達成はしない。全画面モーダルにはせず、地図のパン・ズームを妨げない。 -->
 <section
   id="slope-quest-action-panel"
   class="slope-quest-action-panel"
   hidden
 >
-  <h3>勾配スポットの近くです</h3>
+  <h3>坂道スポットの近くです</h3>
 
   <p id="slope-quest-action-description">
-    坂を最後まで進んだら、踏破達成です。
+    坂を最後まで進んだら、ボタンをプッシュ！ 踏破達成です。
   </p>
 
   <button
@@ -77,7 +77,7 @@
   aria-atomic="true"
 >今日の冒険を達成しました！</div>
 
-<!-- 勾配スポット到達。フォーカスは移さず、発見通知・時間達成通知と同じ簡易通知として表示する -->
+<!-- 坂道スポット到達。フォーカスは移さず、発見通知・時間達成通知と同じ簡易通知として表示する -->
 <div
   id="slope-quest-notification"
   class="slope-quest-notification hidden"
@@ -199,7 +199,7 @@
   </ul>
   <div id="slope-quest-result-badge" class="result-achievement-badge" hidden>
     <span aria-hidden="true">✓</span>
-    <span>勾配スポットを踏破</span>
+    <span>坂道スポットを踏破</span>
   </div>
   <p id="completion-message" class="completion-message"></p>
   <button id="btn-show-achievement-card" class="share-trigger-btn" type="button">成果カードを見る</button>
@@ -246,6 +246,15 @@
       </div>
     </div>
 
+    <div
+      id="achievement-slope-quest-badge"
+      class="result-achievement-badge achievement-result-badge"
+      hidden
+    >
+      <span aria-hidden="true">✓</span>
+      <span>坂道スポットを踏破</span>
+    </div>
+
     <div id="share-privacy-notice" class="share-privacy-notice hidden">
       <p>このカードには現在地や道路名は表示されません。</p>
       <button id="btn-privacy-ack" type="button">OK</button>
@@ -267,7 +276,7 @@
 <!-- クエスト詳細パネル -->
 <div id="quest-panel" class="sheet hidden">
   <div class="sheet-handle"></div>
-  <h2>今日の勾配クエスト</h2>
+  <h2>今日の坂道クエスト</h2>
   <p id="quest-desc">周辺を探索するとクエストが見つかります。</p>
   <div class="quest-meta">
     <span id="quest-distance"></span>

@@ -36,6 +36,10 @@ function loadProductionAdventure(fetchImpl) {
       adventureState,
       ADVENTURE_PRESETS,
       ensureQuest,
+      generateQuest,
+      computeSlopeCandidateBearing,
+      getBearingDifferenceDegrees,
+      filterSlopeQuestCandidatesByDirection,
       drawQuestMarker,
       triggerSlopeQuestCompletion,
       retireSlopeQuestMarkerForEndOfAdventure,
@@ -58,6 +62,8 @@ function loadProductionAdventure(fetchImpl) {
       updateCompletedSlopeSpotsIfNeeded,
       completedSlopeSpotDedupeDistanceM: COMPLETED_SLOPE_SPOT_DEDUPE_DISTANCE_M,
       completedSlopeSpotRenderRadiusM: COMPLETED_SLOPE_SPOT_RENDER_RADIUS_M,
+      slopeDirectionPrimaryMaxDiffDeg: SLOPE_DIRECTION_PRIMARY_MAX_DIFF_DEG,
+      slopeDirectionFallbackMaxDiffDeg: SLOPE_DIRECTION_FALLBACK_MAX_DIFF_DEG,
       setOrigin(o) { origin = o; },
       setLastReliablePosition(p) { lastReliablePosition = p; },
       getLastReliablePosition() { return lastReliablePosition; },
@@ -76,6 +82,28 @@ function loadProductionAdventure(fetchImpl) {
           for (let dy = -QUEST_RING_CELLS; dy <= QUEST_RING_CELLS; dy++) {
             if (dx === 0 && dy === 0) continue;
             visited[cellKey(cix + dx, ciy + dy)] = { ts: Date.now(), lat, lon };
+          }
+        }
+      },
+      markForwardRingCellsVisited(lat, lon, selectedBearing) {
+        const { ix: cix, iy: ciy } = cellIndex(lat, lon);
+        for (let dx = -QUEST_RING_CELLS; dx <= QUEST_RING_CELLS; dx++) {
+          for (let dy = -QUEST_RING_CELLS; dy <= QUEST_RING_CELLS; dy++) {
+            if (dx === 0 && dy === 0) continue;
+            const candidate = cellCenterLatLon(cix + dx, ciy + dy);
+            const bearing = computeSlopeCandidateBearing(
+              lat,
+              lon,
+              candidate.lat,
+              candidate.lon,
+            );
+            if (getBearingDifferenceDegrees(bearing, selectedBearing) <= 90) {
+              visited[cellKey(cix + dx, ciy + dy)] = {
+                ts: Date.now(),
+                lat: candidate.lat,
+                lon: candidate.lon,
+              };
+            }
           }
         }
       },
@@ -232,10 +260,35 @@ function loadProductionAdventure(fetchImpl) {
   };
 }
 
-function activateAdventure(hooks) {
+function activateAdventure(hooks, selectionMode = "flick") {
   hooks.setOrigin(TOKYO);
   hooks.adventureState.status = "active";
+  hooks.adventureState.direction = { sector: 2, label: "東", bearingDeg: 90 };
+  hooks.adventureState.directionSelectionMode = selectionMode;
   hooks.setLastReliablePosition({ lat: TOKYO.lat0, lon: TOKYO.lon0 });
+}
+
+function pointAtBearing(origin, bearingDeg, distanceM = 500) {
+  const radiusM = 6371000;
+  const angularDistance = distanceM / radiusM;
+  const bearing = (bearingDeg * Math.PI) / 180;
+  const lat1 = (origin.lat0 * Math.PI) / 180;
+  const lon1 = (origin.lon0 * Math.PI) / 180;
+  const lat2 = Math.asin(
+    Math.sin(lat1) * Math.cos(angularDistance) +
+      Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing),
+  );
+  const lon2 =
+    lon1 +
+    Math.atan2(
+      Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
+      Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2),
+    );
+  return { lat: (lat2 * 180) / Math.PI, lon: (lon2 * 180) / Math.PI };
+}
+
+function candidateAtBearing(id, bearingDeg) {
+  return { id, ...pointAtBearing(TOKYO, bearingDeg) };
 }
 
 /* ---------- ensureQuest(): 生成条件・ロック（1冒険1候補・固定は変更しない） ---------- */
@@ -256,7 +309,21 @@ test("ensureQuest does nothing without a reliable position", async () => {
   const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
   hooks.setOrigin(TOKYO);
   hooks.adventureState.status = "active";
+  hooks.adventureState.direction = { sector: 2, label: "東", bearingDeg: 90 };
   hooks.setLastReliablePosition(null);
+
+  await hooks.ensureQuest();
+
+  assert.equal(hooks.adventureState.slopeQuest.status, "idle");
+  assert.equal(markerCreations.length, 0);
+});
+
+test("ensureQuest waits until the final adventure direction has been selected", async () => {
+  const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
+  hooks.setOrigin(TOKYO);
+  hooks.adventureState.status = "active";
+  hooks.adventureState.direction = null;
+  hooks.setLastReliablePosition({ lat: TOKYO.lat0, lon: TOKYO.lon0 });
 
   await hooks.ensureQuest();
 
@@ -277,6 +344,130 @@ test("ensureQuest generates exactly one candidate and locks the flag (status -> 
   assert.equal(hooks.adventureState.slopeQuest.arrivalEligible, false);
   assert.equal(hooks.adventureState.slopeQuest.completedThisSession, false);
   assert.equal(markerCreations.length, 1);
+  const selectedBearing = hooks.computeSlopeCandidateBearing(
+    TOKYO.lat0,
+    TOKYO.lon0,
+    hooks.adventureState.slopeQuest.lat,
+    hooks.adventureState.slopeQuest.lng,
+  );
+  assert.ok(hooks.getBearingDifferenceDegrees(selectedBearing, 90) <= 67.5);
+});
+
+/* ---------- 今回の候補だけへ適用する進行方向フィルター ---------- */
+
+test("bearing difference uses the shortest path across the 0/360-degree boundary", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  assert.equal(hooks.getBearingDifferenceDegrees(350, 10), 20);
+  assert.equal(hooks.getBearingDifferenceDegrees(10, 350), 20);
+});
+
+test("east keeps east-side candidates and excludes the west side", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  const result = hooks.filterSlopeQuestCandidatesByDirection(
+    [
+      candidateAtBearing("east", 90),
+      candidateAtBearing("north-east", 45),
+      candidateAtBearing("west", 270),
+    ],
+    TOKYO.lat0,
+    TOKYO.lon0,
+    { sector: 2, label: "東", bearingDeg: 90 },
+  );
+
+  assert.deepEqual(
+    Array.from(result.candidates, (candidate) => candidate.id),
+    ["east", "north-east"],
+  );
+  assert.equal(result.candidateCountBeforeDirectionFilter, 3);
+  assert.equal(result.candidateCountAfterPrimaryFilter, 2);
+});
+
+test("north excludes south-side candidates", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  const result = hooks.filterSlopeQuestCandidatesByDirection(
+    [candidateAtBearing("north", 0), candidateAtBearing("south", 180)],
+    TOKYO.lat0,
+    TOKYO.lon0,
+    { sector: 0, label: "北", bearingDeg: 0 },
+  );
+
+  assert.deepEqual(
+    Array.from(result.candidates, (candidate) => candidate.id),
+    ["north"],
+  );
+});
+
+test("the 67.5-degree primary cone is preferred over candidates only inside 90 degrees", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  assert.equal(hooks.slopeDirectionPrimaryMaxDiffDeg, 67.5);
+  assert.equal(hooks.getBearingDifferenceDegrees(157.5, 90), 67.5);
+  const result = hooks.filterSlopeQuestCandidatesByDirection(
+    [candidateAtBearing("primary", 150), candidateAtBearing("fallback", 170)],
+    TOKYO.lat0,
+    TOKYO.lon0,
+    { sector: 2, label: "東", bearingDeg: 90 },
+  );
+
+  assert.deepEqual(
+    Array.from(result.candidates, (candidate) => candidate.id),
+    ["primary"],
+  );
+  assert.equal(result.candidateCountAfterPrimaryFilter, 1);
+  assert.equal(result.candidateCountAfterFallbackFilter, 2);
+});
+
+test("when the 67.5-degree cone is empty, the filter expands up to and including 90 degrees", () => {
+  const { hooks } = loadProductionAdventure(makeSuccessFetch());
+  assert.equal(hooks.slopeDirectionFallbackMaxDiffDeg, 90);
+  assert.equal(hooks.getBearingDifferenceDegrees(180, 90), 90);
+  const result = hooks.filterSlopeQuestCandidatesByDirection(
+    [candidateAtBearing("fallback", 170), candidateAtBearing("behind", 270)],
+    TOKYO.lat0,
+    TOKYO.lon0,
+    { sector: 2, label: "東", bearingDeg: 90 },
+  );
+
+  assert.deepEqual(
+    Array.from(result.candidates, (candidate) => candidate.id),
+    ["fallback"],
+  );
+  assert.equal(result.candidateCountAfterPrimaryFilter, 0);
+  assert.equal(result.noForwardCandidate, false);
+});
+
+test("candidates beyond 90 degrees, including directly behind, produce no quest", async () => {
+  const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
+  const filtered = hooks.filterSlopeQuestCandidatesByDirection(
+    [candidateAtBearing("rear-side", 200), candidateAtBearing("behind", 270)],
+    TOKYO.lat0,
+    TOKYO.lon0,
+    { sector: 2, label: "東", bearingDeg: 90 },
+  );
+  assert.equal(filtered.candidates.length, 0);
+  assert.equal(filtered.noForwardCandidate, true);
+
+  activateAdventure(hooks);
+  hooks.markForwardRingCellsVisited(TOKYO.lat0, TOKYO.lon0, 90);
+  await hooks.ensureQuest();
+  assert.equal(hooks.adventureState.slopeQuest.status, "unavailable");
+  assert.equal(markerCreations.length, 0);
+});
+
+test("map selection and sign flick use the same final direction data", async () => {
+  const flickRun = loadProductionAdventure(makeSuccessFetch());
+  activateAdventure(flickRun.hooks, "flick");
+  await flickRun.hooks.ensureQuest();
+
+  const mapRun = loadProductionAdventure(makeSuccessFetch());
+  activateAdventure(mapRun.hooks, "map");
+  await mapRun.hooks.ensureQuest();
+
+  assert.equal(flickRun.hooks.adventureState.slopeQuest.status, "ready");
+  assert.equal(mapRun.hooks.adventureState.slopeQuest.status, "ready");
+  assert.equal(
+    mapRun.hooks.adventureState.slopeQuest.cellId,
+    flickRun.hooks.adventureState.slopeQuest.cellId,
+  );
 });
 
 test("ensureQuest ignores repeated calls once a candidate is already ready (GPS ticks do not move or redraw the flag)", async () => {
@@ -455,7 +646,7 @@ test("drawQuestMarker updates an existing flag in place and never clears the que
   assert.equal(originalMarker.getElement().classList.contains("is-nearby"), true);
   assert.equal(
     originalMarker.getElement().getAttribute("aria-label"),
-    "勾配スポットの近くです",
+    "坂道スポットの近くです",
   );
 });
 
@@ -800,21 +991,29 @@ test("dedupeCompletedSlopeSpots collapses duplicates found in stored data (e.g. 
 /* ---------- 新しい候補選定からの踏破済み地点の除外（後段フィルター。順位計算は変更しない） ---------- */
 
 test("generateQuest (via ensureQuest) excludes cells that match a completed spot's cellId or distance, without touching the ranking formula", async () => {
+  const baseline = loadProductionAdventure(makeSuccessFetch());
+  activateAdventure(baseline.hooks);
+  await baseline.hooks.ensureQuest();
+  const excludedCellId = baseline.hooks.adventureState.slopeQuest.cellId;
+  const excludedLat = baseline.hooks.adventureState.slopeQuest.lat;
+  const excludedLng = baseline.hooks.adventureState.slopeQuest.lng;
+
   const { hooks, markerCreations } = loadProductionAdventure(makeSuccessFetch());
   activateAdventure(hooks);
-  const { ix, iy } = hooks.cellIndex(TOKYO.lat0, TOKYO.lon0);
-  // 標高が最も高くなる(=最良候補になる)セルをあらかじめ踏破済みとして登録しておく。
-  // generateQuest()自体のランキング式(gradientPct計算・ソート)は一切変更していないため、
-  // 「除外していなければ選ばれていたはずの最良候補」がちゃんと除外されることを確認する。
-  const bestCandidateCellId = hooks.cellKey(ix, iy + 4); // dx=0,dy=4は候補ループの3番目に相当(既存のmakeSuccessFetchのi===3と対応)
   hooks.setCompletedSlopeSpots([
-    { id: `slope-${bestCandidateCellId}`, lat: 0, lng: 0, cellId: bestCandidateCellId, completedAt: 1 },
+    {
+      id: `slope-${excludedCellId}`,
+      lat: excludedLat,
+      lng: excludedLng,
+      cellId: excludedCellId,
+      completedAt: 1,
+    },
   ]);
 
   await hooks.ensureQuest();
 
   assert.equal(hooks.adventureState.slopeQuest.status, "ready");
-  assert.notEqual(hooks.adventureState.slopeQuest.cellId, bestCandidateCellId);
+  assert.notEqual(hooks.adventureState.slopeQuest.cellId, excludedCellId);
   assert.equal(markerCreations.length, 1);
 });
 
@@ -840,6 +1039,19 @@ test("renderCompletedSlopeSpots only draws spots within the render radius, on th
 
   assert.equal(completedSpotMarkerCreations.length, 1);
   assert.equal(hooks.getCompletedSlopeSpotMarkerCount(), 1);
+});
+
+test("past completed flags remain visible regardless of the current adventure direction", () => {
+  const { hooks, completedSpotMarkerCreations } = loadProductionAdventure(makeSuccessFetch());
+  hooks.adventureState.direction = { sector: 2, label: "東", bearingDeg: 90 };
+  hooks.setCompletedSlopeSpots([
+    { id: "east", lat: TOKYO.lat0, lng: TOKYO.lon0 + 0.001, cellId: "east", completedAt: 1 },
+    { id: "west", lat: TOKYO.lat0, lng: TOKYO.lon0 - 0.001, cellId: "west", completedAt: 2 },
+  ]);
+
+  hooks.renderCompletedSlopeSpots(TOKYO.lat0, TOKYO.lon0);
+
+  assert.equal(completedSpotMarkerCreations.length, 2);
 });
 
 test("renderCompletedSlopeSpots excludes this session's own candidate (questLayer already shows it, avoiding a duplicate flag)", () => {
@@ -900,6 +1112,7 @@ test("ensureQuest's stale-response guard reports every reason string from the sp
     "already-ready",
     "already-completed",
     "unavailable-for-this-session",
+    "direction-not-selected",
     "no-reliable-position",
     "previous-session",
     "adventure-inactive",
@@ -907,6 +1120,54 @@ test("ensureQuest's stale-response guard reports every reason string from the sp
   ]) {
     assert.equal(fn.includes(reason), true, `missing reason: ${reason}`);
   }
+});
+
+test("direction filter debug logging is gated and exposes the requested fields", () => {
+  const fn = appSource.match(
+    /function logSlopeDirectionFilter\([\s\S]*?\n}\n/,
+  )[0];
+  assert.equal(fn.includes("if (!DEBUG_SLOPE_QUEST) return"), true);
+  assert.equal(fn.includes('"[slope-direction-filter]"'), true);
+  for (const field of [
+    "selectedDirection",
+    "selectedBearing",
+    "candidateBearing",
+    "bearingDifference",
+    "passedPrimaryFilter",
+    "passedFallbackFilter",
+    "candidateCountBeforeDirectionFilter",
+    "candidateCountAfterPrimaryFilter",
+    "candidateCountAfterFallbackFilter",
+    "selectedCandidateLat",
+    "selectedCandidateLng",
+    "noForwardCandidate",
+  ]) {
+    assert.equal(fn.includes(field), true, `missing debug field: ${field}`);
+  }
+});
+
+test("direction filtering is a post-generation step and leaves the existing elevation ranking formula unchanged", () => {
+  const fn = appSource.match(
+    /async function generateQuest\([\s\S]*?\n}\n/,
+  )[0];
+  assert.ok(
+    fn.indexOf("filterSlopeQuestCandidatesByDirection") >
+      fn.indexOf("tooCloseToCompleted"),
+  );
+  assert.ok(
+    fn.indexOf("filterSlopeQuestCandidatesByDirection") <
+      fn.indexOf("forwardCandidates.sort"),
+  );
+  assert.equal(
+    fn.includes(
+      "const gradient = Math.abs(elev - curElev) / Math.max(c.dist, 1);",
+    ),
+    true,
+  );
+  assert.equal(
+    fn.includes("shortlist.sort((a, b) => b.gradientPct - a.gradientPct)"),
+    true,
+  );
 });
 
 test("handlePosition delegates to the proximity-only transition and never invokes completion directly", () => {
@@ -986,7 +1247,7 @@ test("endAdventure hides the action panel and conditionally retires the slope-qu
 
 test("service worker cache version was bumped for this fix", () => {
   const sw = readFileSync(join(__dirname, "..", "sw.js"), "utf8");
-  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v31"'), true);
+  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v33"'), true);
   assert.equal(appSource.includes('addEventListener("controllerchange"'), true);
   const reloadFn = appSource.match(
     /function reloadForServiceWorkerUpdateIfSafe\(\)[\s\S]*?\n}\n/,

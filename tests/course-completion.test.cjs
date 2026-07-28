@@ -55,6 +55,7 @@ function loadProductionAdventure() {
       shouldSuppressTimeGoalConfettiForDiscovery,
       getAdventureCompletionData,
       getAdventureEndMessage,
+      shouldShowSlopeQuestResultBadge,
       discoveryNotificationState,
       queueDiscoveryNotification,
       resetAdventureStateKeepHistory,
@@ -686,21 +687,44 @@ test("debug flag for the slope quest is off in production", () => {
   assert.equal(hooks.debugSlopeQuest, false);
 });
 
-test("slope quest wording avoids absolute steepness claims and uses candidate phrasing", () => {
+test("user-facing slope quest wording uses 坂道 while avoiding absolute steepness claims", () => {
   const app = readFileSync(join(__dirname, "..", "app.js"), "utf8");
   const html = readFileSync(join(__dirname, "..", "index.html"), "utf8");
+  const manifest = readFileSync(join(__dirname, "..", "manifest.json"), "utf8");
   const forbidden = ["急勾配", "最も急な坂", "一番急な坂", "最大勾配", "最急地点"];
   for (const phrase of forbidden) {
     assert.equal(app.includes(phrase), false, `app.js must not contain "${phrase}"`);
     assert.equal(html.includes(phrase), false, `index.html must not contain "${phrase}"`);
   }
-  assert.equal(app.includes("勾配スポット"), true);
+  for (const source of [app, html, manifest]) {
+    assert.equal(source.includes("勾配スポット"), false);
+    assert.equal(source.includes("勾配クエスト"), false);
+  }
+  assert.equal(app.includes("坂道スポット候補"), true);
+  assert.equal(html.includes("今日の坂道クエスト"), true);
+  assert.equal(manifest.includes("坂道クエストを探す"), true);
 });
 
-test("slope quest completion message (shown only on manual button press) and log entry use the candidate label", () => {
+test("slope quest completion message (shown only on manual button press) and log entry use the user-facing 坂道 label", () => {
   const { hooks } = loadProductionAdventure();
-  assert.equal(hooks.slopeQuestCompletionMessage, "勾配クエスト踏破！");
-  assert.equal(hooks.slopeQuestLabel, "勾配スポット");
+  assert.equal(hooks.slopeQuestCompletionMessage, "坂道クエスト踏破！");
+  assert.equal(hooks.slopeQuestLabel, "坂道スポット");
+});
+
+test("nearby panel uses the exact heading, instruction, and manual completion button copy", () => {
+  const html = readFileSync(join(__dirname, "..", "index.html"), "utf8");
+  const panel = html.match(
+    /<section[^>]*id="slope-quest-action-panel"[\s\S]*?<\/section>/,
+  );
+  assert.ok(panel);
+  assert.equal(panel[0].includes("坂道スポットの近くです"), true);
+  assert.equal(
+    panel[0].includes(
+      "坂を最後まで進んだら、ボタンをプッシュ！ 踏破達成です。",
+    ),
+    true,
+  );
+  assert.equal(panel[0].includes("坂を踏破した！"), true);
 });
 
 test("slope quest notification element exists with a non-intrusive live region", () => {
@@ -723,7 +747,7 @@ test("completion sheet has exactly one slope-quest result badge, hidden by defau
   const badgeMatch = html.match(/<div[^>]*id="slope-quest-result-badge"[^>]*>/);
   assert.ok(badgeMatch);
   assert.equal(badgeMatch[0].includes("hidden"), true);
-  assert.equal(html.includes("勾配スポットを踏破"), true);
+  assert.equal(html.includes("坂道スポットを踏破"), true);
 
   // 主要3項目の<ul>の中には無い（数値表へは入れない）
   const completionStats = html.match(/<ul class="completion-stats">([\s\S]*?)<\/ul>/);
@@ -734,6 +758,26 @@ test("completion sheet has exactly one slope-quest result badge, hidden by defau
   for (const forbidden of ["未達成", "到達できませんでした", "挑戦失敗"]) {
     assert.equal(html.includes(forbidden), false, `must not contain "${forbidden}"`);
   }
+});
+
+test("slope quest result badges are shown only for this session's explicit completion result", () => {
+  const { hooks } = loadProductionAdventure();
+  assert.equal(
+    hooks.shouldShowSlopeQuestResultBadge({ slopeQuestCompleted: true }),
+    true,
+  );
+  assert.equal(
+    hooks.shouldShowSlopeQuestResultBadge({ slopeQuestCompleted: false }),
+    false,
+  );
+  assert.equal(
+    hooks.shouldShowSlopeQuestResultBadge({
+      arrivalEligible: true,
+      completedSlopeSpots: [{ cellId: "past_flag" }],
+    }),
+    false,
+  );
+  assert.equal(hooks.shouldShowSlopeQuestResultBadge(null), false);
 });
 
 test("slope quest marker is a flag (pole + cloth), not a circular pin, with a >=44x44 tap area and a one-shot completion pop", () => {
@@ -783,7 +827,7 @@ test("reduced-motion stops the ring pulse/pop and shortens notification transiti
 
 test("service worker cache version includes the updated app shell", () => {
   const sw = readFileSync(join(__dirname, "..", "sw.js"), "utf8");
-  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v31"'), true);
+  assert.equal(sw.includes('const CACHE_NAME = "machi-boken-v33"'), true);
   for (const asset of ["./index.html", "./styles.css", "./app.js"]) {
     assert.equal(sw.includes(`"${asset}"`), true, `missing ${asset}`);
   }

@@ -1,5 +1,5 @@
 /* ==========================================================
-   マチ冒険 MVP — 未踏セル開放 × 勾配クエスト
+   マチ冒険 MVP — 未踏セル開放 × 坂道クエスト
    ========================================================== */
 
 // LeafletのSVGレンダラーは既定でビューポート寸法の10%(padding:0.1)しか描画範囲を
@@ -20,13 +20,15 @@ const MAX_QUEST_CANDIDATES = 10; // 標高APIに投げる候補数の上限
 const ELEVATION_ENDPOINT = "https://api.open-elevation.com/api/v1/lookup";
 const ELEVATION_TIMEOUT_MS = 8000; // 標高APIが固まった場合に諦めるまでの時間
 
-// 勾配クエスト: 現在の標高データだけでは特定地点が周辺で最上位の急さだと断定できないため、
+// 坂道クエスト: 現在の標高データだけでは特定地点が周辺で最上位の急さだと断定できないため、
 // 候補地点として扱う表記・演出へ変更する（候補選定アルゴリズム自体は変更しない）。
 // GPS/セル接近判定は「踏破ボタンを表示してよいか」だけに使い、自動達成はしない。
 // 実際の達成は踏破ボタン(complete-slope-quest-button)を押したときだけ確定する。
-const SLOPE_QUEST_LABEL = "勾配スポット";
-const SLOPE_QUEST_COMPLETION_MESSAGE = "勾配クエスト踏破！"; // 踏破ボタン押下時のみ表示（接近だけでは表示しない）
+const SLOPE_QUEST_LABEL = "坂道スポット";
+const SLOPE_QUEST_COMPLETION_MESSAGE = "坂道クエスト踏破！"; // 踏破ボタン押下時のみ表示（接近だけでは表示しない）
 const SLOPE_QUEST_CONFETTI = { intensity: "small", durationMs: 1200 }; // 時間達成と同程度〜やや弱め、累計節目より弱い
+const SLOPE_DIRECTION_PRIMARY_MAX_DIFF_DEG = 67.5;
+const SLOPE_DIRECTION_FALLBACK_MAX_DIFF_DEG = 90;
 // 踏破演出のタイミング目安（すべて概算。歩行中でも読める長さを優先する）。達成後は旗を消さないため、
 // 削除・フェードアウト用の値は持たない。
 const SLOPE_QUEST_TIMING = {
@@ -42,7 +44,7 @@ const SLOPE_QUEST_NOTIFICATION_TIMING = {
 };
 const DEBUG_SLOPE_QUEST = false; // trueにすると接近判定・踏破演出・永続化の計測値をコンソールへ出力する（本番はfalse）
 
-// 踏破済み勾配スポットの恒久保存・再表示（霧晴れのように街へ蓄積される成果）
+// 踏破済み坂道スポットの恒久保存・再表示（霧晴れのように街へ蓄積される成果）
 const COMPLETED_SLOPE_SPOT_DEDUPE_DISTANCE_M = 200; // 既存のセルサイズ(200m)に合わせ、同じセル相当を重複扱いにする
 const COMPLETED_SLOPE_SPOT_RENDER_RADIUS_M = 800; // QUEST_RING_CELLS(±4セル≒800m)と同じ範囲だけ、過去旗を描画する
 
@@ -272,12 +274,12 @@ const DEBUG_SIGN_RELEASE_VELOCITY = false; // trueで1操作ごとにリリー�
 const STORAGE_KEYS = {
   origin: "am_origin",
   visited: "am_visited",
-  // "am_quest"は廃止。今回セッション用の勾配スポット候補はadventureState.slopeQuest
+  // "am_quest"は廃止。今回セッション用の坂道スポット候補はadventureState.slopeQuest
   // (セッション限定・localStorage未保存)。既存ブラウザに残る値は今後読み書きしない。
   log: "am_log",
   milestones: "am_milestones",
   privacyAck: "am_share_privacy_ack",
-  completedSlopeSpots: "am_completed_slope_spots", // 踏破済み勾配スポット（恒久保存。霧晴れ同様、街へ蓄積する成果）
+  completedSlopeSpots: "am_completed_slope_spots", // 踏破済み坂道スポット（恒久保存。霧晴れ同様、街へ蓄積する成果）
 };
 
 /* ---------- ローカルストレージ ヘルパー ---------- */
@@ -299,7 +301,7 @@ let origin = store.get(STORAGE_KEYS.origin, null); // {lat0, lon0}
 let visited = store.get(STORAGE_KEYS.visited, {}); // { "ix_iy": {ts,lat,lon} }
 let log = store.get(STORAGE_KEYS.log, []); // [{ts, type, label}]
 
-/* ---------- 踏破済み勾配スポット（恒久保存） ----------
+/* ---------- 踏破済み坂道スポット（恒久保存） ----------
    保存はすべて・描画は近くのものだけ。壊れたデータがあっても無視するだけでアプリは止めない。 */
 
 // 同一地点判定: 同じcellIdか、保存済み地点から一定距離以内なら同じ地点として扱う（重複防止・候補除外の両方で使う）。
@@ -439,6 +441,114 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
+function normalizeBearingDegrees(bearingDeg) {
+  if (!Number.isFinite(bearingDeg)) return null;
+  return ((bearingDeg % 360) + 360) % 360;
+}
+
+// 現在地から候補地点への球面上の初期方位角。0度=北、90度=東。
+function computeSlopeCandidateBearing(curLat, curLon, targetLat, targetLon) {
+  if (
+    ![curLat, curLon, targetLat, targetLon].every(Number.isFinite) ||
+    (curLat === targetLat && curLon === targetLon)
+  ) {
+    return null;
+  }
+  const toRad = (degrees) => (degrees * Math.PI) / 180;
+  const lat1 = toRad(curLat);
+  const lat2 = toRad(targetLat);
+  const deltaLon = toRad(targetLon - curLon);
+  const y = Math.sin(deltaLon) * Math.cos(lat2);
+  const x =
+    Math.cos(lat1) * Math.sin(lat2) -
+    Math.sin(lat1) * Math.cos(lat2) * Math.cos(deltaLon);
+  return normalizeBearingDegrees((Math.atan2(y, x) * 180) / Math.PI);
+}
+
+function getBearingDifferenceDegrees(candidateBearing, selectedBearing) {
+  const candidate = normalizeBearingDegrees(candidateBearing);
+  const selected = normalizeBearingDegrees(selectedBearing);
+  if (candidate == null || selected == null) return Infinity;
+  return Math.abs(((candidate - selected + 540) % 360) - 180);
+}
+
+// 踏破済み・近すぎる地点を除外した後の候補だけを対象に、前方67.5度、
+// 候補がなければ左右90度までへ緩和する。後方候補へはフォールバックしない。
+function filterSlopeQuestCandidatesByDirection(
+  candidates,
+  curLat,
+  curLon,
+  selectedDirection,
+) {
+  const sourceCandidates = Array.isArray(candidates) ? candidates : [];
+  const selectedBearing = normalizeBearingDegrees(
+    selectedDirection && selectedDirection.bearingDeg,
+  );
+  const candidatesWithBearing = sourceCandidates
+    .map((candidate) => {
+      const candidateBearing = computeSlopeCandidateBearing(
+        curLat,
+        curLon,
+        candidate.lat,
+        candidate.lon,
+      );
+      const bearingDifference = getBearingDifferenceDegrees(
+        candidateBearing,
+        selectedBearing,
+      );
+      return {
+        ...candidate,
+        candidateBearing,
+        bearingDifference,
+        passedPrimaryFilter:
+          bearingDifference <= SLOPE_DIRECTION_PRIMARY_MAX_DIFF_DEG,
+        passedFallbackFilter:
+          bearingDifference <= SLOPE_DIRECTION_FALLBACK_MAX_DIFF_DEG,
+      };
+    })
+    .filter((candidate) => candidate.candidateBearing != null);
+  const primaryCandidates = candidatesWithBearing.filter(
+    (candidate) => candidate.passedPrimaryFilter,
+  );
+  const fallbackCandidates = candidatesWithBearing.filter(
+    (candidate) => candidate.passedFallbackFilter,
+  );
+
+  return {
+    candidates:
+      primaryCandidates.length > 0 ? primaryCandidates : fallbackCandidates,
+    selectedDirection,
+    selectedBearing,
+    candidateCountBeforeDirectionFilter: sourceCandidates.length,
+    candidateCountAfterPrimaryFilter: primaryCandidates.length,
+    candidateCountAfterFallbackFilter: fallbackCandidates.length,
+    noForwardCandidate: fallbackCandidates.length === 0,
+  };
+}
+
+function logSlopeDirectionFilter(directionFilter, picked) {
+  if (!DEBUG_SLOPE_QUEST) return;
+  console.log("[slope-direction-filter]", {
+    selectedDirection: directionFilter.selectedDirection
+      ? directionFilter.selectedDirection.label
+      : null,
+    selectedBearing: directionFilter.selectedBearing,
+    candidateBearing: picked ? picked.candidateBearing : null,
+    bearingDifference: picked ? picked.bearingDifference : null,
+    passedPrimaryFilter: picked ? picked.passedPrimaryFilter : false,
+    passedFallbackFilter: picked ? picked.passedFallbackFilter : false,
+    candidateCountBeforeDirectionFilter:
+      directionFilter.candidateCountBeforeDirectionFilter,
+    candidateCountAfterPrimaryFilter:
+      directionFilter.candidateCountAfterPrimaryFilter,
+    candidateCountAfterFallbackFilter:
+      directionFilter.candidateCountAfterFallbackFilter,
+    selectedCandidateLat: picked ? picked.lat : null,
+    selectedCandidateLng: picked ? picked.lon : null,
+    noForwardCandidate: directionFilter.noForwardCandidate,
+  });
+}
+
 /* ---------- 地図 ---------- */
 let map, cellsLayer, questLayer, meMarker;
 let completedSlopeSpotsLayer = null; // 過去に踏破済みの旗（今回のクエスト旗とはレイヤーを分ける）
@@ -524,7 +634,7 @@ function initMap(lat, lon) {
     }
   });
 
-  // 勾配スポット候補はadventureState.slopeQuest(セッション限定)へ移行したため、
+  // 坂道スポット候補はadventureState.slopeQuest(セッション限定)へ移行したため、
   // ページ読み込み直後にlocalStorageから復元することはしない（冒険自体もリロードでは復元しない）。
   // 一方、踏破済み地点(completedSlopeSpots)は恒久保存のため、起動直後の現在地周辺だけ描画する。
   renderCompletedSlopeSpots(lat, lon);
@@ -558,9 +668,9 @@ function drawVisitedCell(ix, iy, opts) {
   return rect;
 }
 
-// 勾配スポットの候補マーカー本体。丸型ピンは現在地マーカー(円形・amber塗り)と
+// 坂道スポットの候補マーカー本体。丸型ピンは現在地マーカー(円形・amber塗り)と
 // 見分けがつきにくかったため、旗竿+旗布のフラッグ型（丸を使わない形）へ変更した。
-let questMarker = null; // 現在表示中の勾配スポットマーカー（Leafletインスタンス）
+let questMarker = null; // 現在表示中の坂道スポットマーカー（Leafletインスタンス）
 let slopeQuestMarkerTimers = []; // 到達演出（チェック済み化・フェードアウト）用のタイマーID
 // 到達演出(チェック済み化→フェードアウト)が終わるまでtrueにする。単なる同一tick内の
 // 多重実行ガードだけでなく、演出中にdrawQuestMarker()が再度呼ばれた場合に
@@ -767,7 +877,7 @@ function completeSlopeQuestManually() {
 }
 
 /* ==========================================================
-   踏破済み勾配スポットの表示（今回のクエスト旗とは別レイヤー）
+   踏破済み坂道スポットの表示（今回のクエスト旗とは別レイヤー）
    保存はすべて・描画は現在地周辺だけ。今回セッション自身の候補は、今回のクエスト旗(questLayer)側が
    表示を担当するため、ここでは除外する（同じ地点が二重に表示されるのを防ぐ）。
    ========================================================== */
@@ -785,7 +895,7 @@ function formatCompletedSlopeSpotDate(ts) {
 // 過去旗をタップした場合の簡潔な表示。標高・勾配率・順位は表示しない（精度に断定できないため）。
 function openCompletedSlopeSpotInfo(spot) {
   const dateLabel = formatCompletedSlopeSpotDate(spot.completedAt);
-  showToast(dateLabel ? `勾配スポット踏破済み（${dateLabel}）` : "勾配スポット踏破済み");
+  showToast(dateLabel ? `坂道スポット踏破済み（${dateLabel}）` : "坂道スポット踏破済み");
 }
 
 // 現在地周辺(COMPLETED_SLOPE_SPOT_RENDER_RADIUS_M以内)の踏破済み地点だけを描画する。
@@ -830,7 +940,7 @@ function renderCompletedSlopeSpots(lat, lon) {
     }).addTo(completedSlopeSpotsLayer);
     marker.on("click", () => openCompletedSlopeSpotInfo(spot));
     const element = marker.getElement();
-    if (element) element.setAttribute("aria-label", "勾配スポット踏破済み");
+    if (element) element.setAttribute("aria-label", "坂道スポット踏破済み");
     completedSlopeSpotMarkersByCellId.set(spot.id, marker);
   });
 
@@ -986,12 +1096,12 @@ function openQuestPanel() {
   el("quest-panel").classList.remove("hidden");
   const q = adventureState.slopeQuest;
   if (q.status === "ready" || q.status === "nearby" || q.status === "completed") {
-    el("quest-desc").textContent = "地図上の勾配スポットへ行ってみよう。";
+    el("quest-desc").textContent = "地図上の坂道スポットへ行ってみよう。";
     el("quest-gradient").textContent =
       q.score != null ? `勾配目安 ${q.score}%` : "勾配 不明";
   } else {
     el("quest-desc").textContent =
-      "周辺を探索すると勾配スポット候補が見つかります。";
+      "周辺を探索すると坂道スポット候補が見つかります。";
     el("quest-gradient").textContent = "";
   }
 }
@@ -1019,7 +1129,7 @@ function renderLog() {
   });
 }
 
-/* ---------- 勾配クエスト生成 ---------- */
+/* ---------- 坂道クエスト生成 ---------- */
 async function fetchElevations(points) {
   // points: [{latitude, longitude}, ...]
   const controller = new AbortController();
@@ -1042,7 +1152,7 @@ async function fetchElevations(points) {
 let lastQuestGenerationExcludedAsCompleted = 0; // デバッグログ用。generateQuest()呼び出しのたびにリセットする
 let lastQuestGenerationExcludedAsNearby = 0;
 
-async function generateQuest(curLat, curLon) {
+async function generateQuest(curLat, curLon, selectedDirection) {
   const { ix: cix, iy: ciy } = cellIndex(curLat, curLon);
   lastQuestGenerationExcludedAsCompleted = 0;
   lastQuestGenerationExcludedAsNearby = 0;
@@ -1079,10 +1189,20 @@ async function generateQuest(curLat, curLon) {
     }
   }
 
-  if (candidates.length === 0) return null;
+  const directionFilter = filterSlopeQuestCandidatesByDirection(
+    candidates,
+    curLat,
+    curLon,
+    selectedDirection,
+  );
+  const forwardCandidates = directionFilter.candidates;
+  if (forwardCandidates.length === 0) {
+    logSlopeDirectionFilter(directionFilter, null);
+    return null;
+  }
 
-  candidates.sort((a, b) => a.dist - b.dist);
-  const shortlist = candidates.slice(0, MAX_QUEST_CANDIDATES);
+  forwardCandidates.sort((a, b) => a.dist - b.dist);
+  const shortlist = forwardCandidates.slice(0, MAX_QUEST_CANDIDATES);
 
   try {
     const points = [
@@ -1101,6 +1221,7 @@ async function generateQuest(curLat, curLon) {
 
     shortlist.sort((a, b) => b.gradientPct - a.gradientPct);
     const picked = shortlist[0];
+    logSlopeDirectionFilter(directionFilter, picked);
     // 一時デバッグ用: 平坦な地点が選ばれていないかを確認するための計測値。
     // minimumRequiredGradePercentは現状常にnull＝最小勾配条件はまだ存在しない（未実装であることをそのまま示す）。
     if (DEBUG_SLOPE_QUEST) {
@@ -1124,6 +1245,7 @@ async function generateQuest(curLat, curLon) {
   } catch (e) {
     // 標高APIが失敗した場合は距離最短の候補をフォールバックにする
     const fallback = { ...shortlist[0], gradientPct: null };
+    logSlopeDirectionFilter(directionFilter, fallback);
     if (DEBUG_SLOPE_QUEST) {
       console.log("[slope-quest-candidate]", {
         candidateLat: fallback.lat,
@@ -1154,8 +1276,8 @@ function createSlopeQuestRequestId() {
 }
 
 // 1冒険につき候補は1回だけ選定し、冒険終了まで固定する入口。GPS更新のたびに呼ばれるが、
-// 実際に検索が始まるのは「冒険中・slopeQuestが未選定(idle)・信頼できる現在地がある」の
-// 3条件を満たす最初の1回だけ（他の呼び出しは即座に無視される）。
+// 実際に検索が始まるのは「冒険中・slopeQuestが未選定(idle)・方向確定済み・
+// 信頼できる現在地がある」の4条件を満たす最初の1回だけ（他の呼び出しは即座に無視される）。
 async function ensureQuest() {
   if (adventureState.status !== "active") {
     logSlopeQuestLockDebug({ candidateGenerationAttempted: false, candidateIgnoredReason: "adventure-inactive" });
@@ -1175,6 +1297,16 @@ async function ensureQuest() {
     });
     return;
   }
+  if (
+    !adventureState.direction ||
+    !Number.isFinite(adventureState.direction.bearingDeg)
+  ) {
+    logSlopeQuestLockDebug({
+      candidateGenerationAttempted: false,
+      candidateIgnoredReason: "direction-not-selected",
+    });
+    return;
+  }
   if (!lastReliablePosition) {
     logSlopeQuestLockDebug({ candidateGenerationAttempted: false, candidateIgnoredReason: "no-reliable-position" });
     return;
@@ -1182,13 +1314,18 @@ async function ensureQuest() {
 
   const requestId = createSlopeQuestRequestId();
   const sessionIdAtRequest = adventureState.sessionId;
+  const selectedDirectionAtRequest = { ...adventureState.direction };
   adventureState.slopeQuest.status = "pending";
   adventureState.slopeQuest.requestId = requestId;
   logSlopeQuestLockDebug({ candidateGenerationAttempted: true, candidateIgnoredReason: null });
 
   let picked = null;
   try {
-    picked = await generateQuest(lastReliablePosition.lat, lastReliablePosition.lon);
+    picked = await generateQuest(
+      lastReliablePosition.lat,
+      lastReliablePosition.lon,
+      selectedDirectionAtRequest,
+    );
   } catch (e) {
     picked = null;
   }
@@ -1757,7 +1894,7 @@ function selectAdventurePreset(presetKey) {
   adventureState.routePoints = [];
   adventureState.lastRoutePoint = null;
   adventureState.slopeQuestNotificationPending = false;
-  // 勾配スポット候補(今回セッション用)は新しい冒険開始時だけリセットする（現在地更新・霧更新・
+  // 坂道スポット候補(今回セッション用)は新しい冒険開始時だけリセットする（現在地更新・霧更新・
   // エリア進入・接近では再選定しない）。踏破済み地点の保存(am_completed_slope_spots/
   // completedSlopeSpots)はここでは一切触れない——リセットするのは「今回」の状態だけ。
   adventureState.slopeQuest = {
@@ -2763,7 +2900,7 @@ function enterMapDirectionMode(currentPos) {
   if (backBtn) backBtn.focus();
 }
 
-// 地図タップ・勾配スポット旗タップの両方から呼ばれる共通入口。
+// 地図タップ・坂道スポット旗タップの両方から呼ばれる共通入口。
 // 旗をタップしても目的地確定はしない（openQuestPanelを呼ばず、通常のタップと同様に方角だけ示す）。
 function handleMapDirectionTap(e) {
   if (!mapDirectionModeActive || !e || !e.latlng) return;
@@ -3461,7 +3598,7 @@ function runDiscoveryMessagePhase({
 
 function finishDiscoveryNotification() {
   clearDiscoveryNotification({ flushPendingToast: true });
-  // 優先順位: 発見通知＞累計節目＞勾配スポット到達＞時間達成。
+  // 優先順位: 発見通知＞累計節目＞坂道スポット到達＞時間達成。
   if (adventureState.slopeQuestNotificationPending) {
     showSlopeQuestNotification();
   }
@@ -3690,7 +3827,7 @@ function spawnConfetti(options) {
   }
 }
 
-/* ---------- 勾配スポット踏破 ----------
+/* ---------- 坂道スポット踏破 ----------
    GPS/セル接近判定は「踏破ボタンを表示してよいか」だけに使い、自動達成はしない。
    実際の達成は踏破ボタン(complete-slope-quest-button)を押したときだけ確定する。
    達成後は旗を消さず、そのまま冒険終了・次回以降も保存済み旗として残す。候補選定・標高取得は変更しない。
@@ -3873,7 +4010,7 @@ function buildSlopeQuestArrivalDebugContext(curLat, curLon) {
   };
 }
 
-// 勾配スポットへの到達を検出した際の入口。handlePosition()から、既存の到達判定
+// 坂道スポットへの到達を検出した際の入口。handlePosition()から、既存の到達判定
 // (adventureState.slopeQuest.status==='ready'かつ同一セル一致、変更しない)がtrueの時だけ呼ばれる。
 // 踏破ボタン押下時にのみ呼ばれる（completeSlopeQuestManually経由）。接近判定(自動)からは呼ばれない。
 // 呼び出し前提: quest.completedThisSession/status='completed'は既にcompleteSlopeQuestManually側で
@@ -3916,7 +4053,7 @@ function triggerSlopeQuestCompletion(saveResult) {
     }
   }
 
-  // 優先順位: 霧晴れ＞発見通知＞累計節目＞勾配クエスト踏破＞時間達成。
+  // 優先順位: 霧晴れ＞発見通知＞累計節目＞坂道クエスト踏破＞時間達成。
   // 発見通知が進行中なら、その終了時(finishDiscoveryNotification)に回す。
   // 遅延させてよいのは紙吹雪とメッセージだけで、旗の状態・保存処理はここまでで既に完了している。
   const notificationQueued = true;
@@ -4201,6 +4338,17 @@ function getAdventureEndMessage(discoveredCellCount) {
     : ADVENTURE_END_MESSAGES.noDiscovery;
 }
 
+function shouldShowSlopeQuestResultBadge(completionData) {
+  return completionData?.slopeQuestCompleted === true;
+}
+
+function updateSlopeQuestResultBadge(elementId, completionData) {
+  const badge = el(elementId);
+  const shouldShow = shouldShowSlopeQuestResultBadge(completionData);
+  if (badge) badge.hidden = !shouldShow;
+  return shouldShow;
+}
+
 function showCompletionSheet(completionData) {
   const data = completionData || getAdventureCompletionData();
   el("completion-title").textContent = "今日の冒険、おつかれさま！";
@@ -4217,13 +4365,15 @@ function showCompletionSheet(completionData) {
     data.distanceMeters,
   );
   el("completion-discovered-cells").textContent = `${data.discoveredCellCount}`;
-  const badge = el("slope-quest-result-badge");
-  if (badge) badge.hidden = !data.slopeQuestCompleted;
+  const resultBadgeShown = updateSlopeQuestResultBadge(
+    "slope-quest-result-badge",
+    data,
+  );
   logSlopeQuestPersistenceDebug({
-    resultBadgeShown: !!data.slopeQuestCompleted,
+    resultBadgeShown,
   });
   logSlopeQuestStateReview("result-rendered", {
-    resultBadgeVisible: !!data.slopeQuestCompleted,
+    resultBadgeVisible: resultBadgeShown,
   });
   lastCompletionMessage = getAdventureEndMessage(data.discoveredCellCount);
   el("completion-message").textContent = lastCompletionMessage;
@@ -4367,6 +4517,8 @@ function showDirectionCard() {
 
 /* ---------- Priority 2 + 4: 冒険成果カード ---------- */
 function showAchievementCard() {
+  const completionData =
+    adventureState.completionData || getAdventureCompletionData();
   el("achievement-cell-count").textContent =
     `${adventureState.sessionDiscoveredCellIds.size}`;
   const preset = adventureState.preset
@@ -4378,6 +4530,10 @@ function showAchievementCard() {
   el("achievement-direction").textContent = adventureState.direction
     ? adventureState.direction.label
     : "--";
+  updateSlopeQuestResultBadge(
+    "achievement-slope-quest-badge",
+    completionData,
+  );
   el("achievement-message").textContent = lastCompletionMessage;
 
   const notice = el("share-privacy-notice");
@@ -4643,7 +4799,7 @@ window.addEventListener("DOMContentLoaded", () => {
   el("btn-end-adventure").addEventListener("click", endAdventure);
   document.addEventListener("visibilitychange", handleAdventureVisibilityChange);
 
-  // ---- 勾配スポット踏破ボタン（接近判定だけでは自動達成しない） ----
+  // ---- 坂道スポット踏破ボタン（接近判定だけでは自動達成しない） ----
   el("complete-slope-quest-button").addEventListener(
     "click",
     completeSlopeQuestManually,

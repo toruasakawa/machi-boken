@@ -440,7 +440,7 @@ body {
   font-size: 12px;
 }
 
-/* 勾配スポット踏破ボタン。地図の下部に固定するが、全画面モーダルにはせず
+/* 坂道スポット踏破ボタン。地図の下部に固定するが、全画面モーダルにはせず
    地図のパン・ズームは妨げない(この要素自体が画面全体を覆うことはない)。 */
 .slope-quest-action-panel {
   position: fixed;
@@ -517,7 +517,7 @@ body {
   display: none;
 }
 
-/* 勾配スポット到達通知。時間達成通知と同じ見せ方（発見系より優先度が下のため異なるz-index）。 */
+/* 坂道スポット到達通知。時間達成通知と同じ見せ方（発見系より優先度が下のため異なるz-index）。 */
 #slope-quest-notification {
   position: fixed;
   left: 50%;
@@ -970,6 +970,13 @@ body {
 .result-achievement-badge[hidden] {
   display: none;
 }
+.achievement-result-badge {
+  max-width: 100%;
+  margin: 0;
+  padding: 5px 10px;
+  font-size: 11px;
+  white-space: nowrap;
+}
 .completion-message {
   color: var(--amber);
   font-size: 14px;
@@ -1283,7 +1290,7 @@ body {
   #slope-quest-notification.is-visible {
     transform: translate(-50%, 0);
   }
-  /* 勾配スポットマーカー: 呼吸・ポップ演出を止め、チェック済みへの切り替えも情報自体は維持する */
+  /* 坂道スポットマーカー: 呼吸・ポップ演出を止め、チェック済みへの切り替えも情報自体は維持する */
   .slope-quest-marker__ring {
     animation: none;
     opacity: 0.3;
@@ -1301,7 +1308,7 @@ body {
   }
 }
 
-/* Leaflet marker tweak: 勾配スポット候補マーカー（フラッグ型。円形の現在地マーカーと混同しないよう
+/* Leaflet marker tweak: 坂道スポット候補マーカー（フラッグ型。円形の現在地マーカーと混同しないよう
    丸を使わず、旗竿(pole)+旗布(cloth)の形で構成する） */
 .slope-quest-marker {
   position: relative;

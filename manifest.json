@@ -1,7 +1,7 @@
 {
   "name": "マチ冒険 - 未踏セル探索",
   "short_name": "マチ冒険",
-  "description": "日常の移動を冒険に変える。歩いた街のセルを開放し、勾配クエストを探す。",
+  "description": "日常の移動を冒険に変える。歩いた街のセルを開放し、坂道クエストを探す。",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",

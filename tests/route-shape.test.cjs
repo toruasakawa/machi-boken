@@ -365,3 +365,40 @@ test("achievement card uses a GPS route SVG and has no cell-shape fallback", () 
   );
   assert.equal(app.includes("animate: false"), true);
 });
+
+test("achievement card includes a compact slope-quest badge driven by the completion snapshot", () => {
+  const html = readFileSync(join(__dirname, "..", "index.html"), "utf8");
+  const app = readFileSync(join(__dirname, "..", "app.js"), "utf8");
+  const css = readFileSync(join(__dirname, "..", "styles.css"), "utf8");
+
+  const cardStart = html.indexOf('<div id="achievement-card"');
+  const cardEnd = html.indexOf("<!-- クエスト詳細パネル -->", cardStart);
+  assert.notEqual(cardStart, -1);
+  assert.notEqual(cardEnd, -1);
+  const card = html.slice(cardStart, cardEnd);
+  assert.equal(card.includes('id="achievement-slope-quest-badge"'), true);
+  assert.equal(card.includes("result-achievement-badge"), true);
+  assert.equal(card.includes("achievement-result-badge"), true);
+  assert.equal(card.includes("坂道スポットを踏破"), true);
+  const badgeTag = card.match(
+    /<div[^>]*id="achievement-slope-quest-badge"[^>]*>/,
+  );
+  assert.ok(badgeTag);
+  assert.equal(badgeTag[0].includes("hidden"), true);
+
+  const showCard = app.match(/function showAchievementCard\(\)[\s\S]*?\n}/);
+  assert.ok(showCard);
+  assert.equal(showCard[0].includes("adventureState.completionData"), true);
+  assert.equal(showCard[0].includes("getAdventureCompletionData()"), true);
+  assert.equal(
+    showCard[0].includes('"achievement-slope-quest-badge"'),
+    true,
+  );
+  assert.equal(showCard[0].includes("completedSlopeSpots"), false);
+
+  const badgeCss = css.match(/\.achievement-result-badge \{([\s\S]*?)\n}/);
+  assert.ok(badgeCss);
+  assert.equal(badgeCss[1].includes("max-width: 100%"), true);
+  assert.equal(badgeCss[1].includes("white-space: nowrap"), true);
+  assert.equal(badgeCss[1].includes("font-size: 11px"), true);
+});

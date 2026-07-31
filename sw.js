@@ -1,4 +1,4 @@
-const CACHE_NAME = "machi-boken-v34";
+const CACHE_NAME = "machi-boken-v35";
 const SHELL_ASSETS = [
   "./",
   "./index.html",
@@ -29,7 +29,11 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
   // 標高API・地図タイルなど外部リクエストはキャッシュせずそのまま通す
-  if (url.origin !== self.location.origin) return;
+  // Vercel Web Analytics(/_vercel/insights/*)も同一オリジンだが対象外にする。
+  // 計測ビーコンはPOSTのため、Cache APIでcache.put()すると例外(未処理のPromise rejection)になる。
+  if (url.origin !== self.location.origin || url.pathname.startsWith("/_vercel/insights/")) {
+    return;
+  }
 
   event.respondWith(
     caches.match(event.request).then((cached) => {
